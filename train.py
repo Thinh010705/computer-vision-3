@@ -31,6 +31,9 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=2, help="DataLoader workers")
     parser.add_argument("--resume", type=str, default=None, help="Optional checkpoint for fine-tuning/resume")
     parser.add_argument("--no_pretrained", action="store_true", help="Initialize ConvNeXt backbone without ImageNet weights")
+    parser.add_argument("--mosaic_prob", type=float, default=0.15, help="Mosaic probability during the strong augmentation phase")
+    parser.add_argument("--close_mosaic_epochs", type=int, default=15, help="Disable mosaic and strong augmentation for final epochs")
+    parser.add_argument("--fine_tune_lr_scale", type=float, default=0.25, help="Multiply LR when entering final fine-tune phase")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     return parser.parse_args()
 
@@ -193,6 +196,8 @@ def train(args):
     # Default resolution is 448 (yielding 14x14 grid size)
     train_dataset = DetectionDataset(args.train_data, args.image_dir, resolution=448, is_train=True)
     val_dataset = DetectionDataset(args.val_data, args.val_image_dir, resolution=448, is_train=False)
+    train_dataset.base_mosaic_prob = args.mosaic_prob
+    train_dataset.set_training_stage("strong")
     
     print(f"Loaded {len(train_dataset)} training examples and {len(val_dataset)} validation examples.")
     
@@ -243,6 +248,7 @@ def train(args):
     ], weight_decay=args.weight_decay)
 
     start_epoch = 0
+    resume_best_map = 0.0
     if args.resume:
         print(f"Resuming/fine-tuning from: {args.resume}")
         try:
@@ -254,6 +260,7 @@ def train(args):
             if "optimizer_state_dict" in checkpoint:
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             start_epoch = int(checkpoint.get("epoch", -1)) + 1
+            resume_best_map = float(checkpoint.get("mAP", 0.0))
         else:
             model.load_state_dict(checkpoint)
     
@@ -266,18 +273,31 @@ def train(args):
     except (TypeError, ValueError, AttributeError):
         scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
         
-    best_map = 0.0
-    scales = [384, 416, 448, 480] # Multi-scale resolutions (multiples of 32)
+    best_map = resume_best_map
+    scales = [416, 448, 480]
+    fine_start_epoch = max(0, args.epochs - args.close_mosaic_epochs)
+    fine_lr_applied = False
     
     for epoch in range(start_epoch, args.epochs):
         model.train()
-        
-        # 5. Multi-Scale Training: pick a random resolution at the start of each epoch
-        if args.multi_scale and torch.cuda.is_available():
+
+        fine_phase = epoch >= fine_start_epoch
+        if fine_phase:
+            train_dataset.set_training_stage("fine")
+            train_dataset.set_resolution(448)
+            if not fine_lr_applied:
+                for group in optimizer.param_groups:
+                    group["lr"] *= args.fine_tune_lr_scale
+                fine_lr_applied = True
+            print(f"\n--- Epoch {epoch+1}/{args.epochs} | Fine-tune phase: mosaic OFF, light augmentation, 448x448 ---")
+        elif args.multi_scale and torch.cuda.is_available():
+            train_dataset.set_training_stage("strong")
             new_res = random.choice(scales)
             train_dataset.set_resolution(new_res)
             print(f"\n--- Epoch {epoch+1}/{args.epochs} | Multi-scale target resolution set to: {new_res}x{new_res} ---")
         else:
+            train_dataset.set_training_stage("strong")
+            train_dataset.set_resolution(448)
             print(f"\n--- Epoch {epoch+1}/{args.epochs} | Target resolution: 448x448 ---")
             
         epoch_loss = 0.0

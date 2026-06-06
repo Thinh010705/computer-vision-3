@@ -19,6 +19,9 @@ class DetectionDataset(Dataset):
         self.is_train = is_train
         self.resolution = resolution
         self.grid_size = resolution // 16  # Stable Stride 16 Resolution Grid
+        self.base_mosaic_prob = 0.15
+        self.mosaic_prob = self.base_mosaic_prob
+        self.training_stage = "strong"
         
         # Load classes
         self.classes = ["person", "car", "dog", "cat", "chair"]
@@ -89,41 +92,60 @@ class DetectionDataset(Dataset):
                 A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
                 ToTensorV2()
             ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['category_ids'], min_visibility=0.0))
+        self._build_transform()
 
-    def set_resolution(self, resolution):
-        """
-        Dynamically update the target resolution and grid size for Multi-Scale training.
-        """
-        self.resolution = resolution
-        self.grid_size = resolution // 16  # Stable Stride 16 Resolution Grid
-        
-        # Re-initialize transform pipeline with new resolution
-        if self.is_train:
-            self.transform = A.Compose([
-                A.HorizontalFlip(p=0.5),
-                A.RandomResizedCrop(
-                    size=(self.resolution, self.resolution),
-                    scale=(0.8, 1.0),
-                    ratio=(0.9, 1.11),
-                    p=0.5
-                ),
-                A.Resize(self.resolution, self.resolution),  # ALWAYS ensure final resolution matches self.resolution
-                A.Affine(scale=(0.9, 1.1), translate_percent=(-0.05, 0.05), rotate=(-15, 15), shear=(-10, 10), border_mode=0, p=0.5),
-                A.CLAHE(clip_limit=2.0, p=0.3),
-                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-                A.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=20, val_shift_limit=20, p=0.5),
-                A.GaussNoise(p=0.2),
-                A.MotionBlur(blur_limit=3, p=0.2),
-                A.CoarseDropout(num_holes_range=(1, 8), hole_height_range=(8, 24), hole_width_range=(8, 24), p=0.3),  # Cutout
-                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-                ToTensorV2()
-            ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['category_ids'], min_visibility=0.3))
-        else:
+    def _build_transform(self):
+        if not self.is_train:
             self.transform = A.Compose([
                 A.Resize(self.resolution, self.resolution),
                 A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
                 ToTensorV2()
             ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['category_ids'], min_visibility=0.0))
+            return
+
+        if self.training_stage == "fine":
+            transforms = [
+                A.HorizontalFlip(p=0.5),
+                A.Resize(self.resolution, self.resolution),
+                A.RandomBrightnessContrast(brightness_limit=0.10, contrast_limit=0.10, p=0.25),
+                A.HueSaturationValue(hue_shift_limit=5, sat_shift_limit=8, val_shift_limit=8, p=0.20),
+            ]
+        else:
+            transforms = [
+                A.HorizontalFlip(p=0.5),
+                A.RandomResizedCrop(
+                    size=(self.resolution, self.resolution),
+                    scale=(0.9, 1.0),
+                    ratio=(0.95, 1.05),
+                    p=0.35
+                ),
+                A.Resize(self.resolution, self.resolution),
+                A.Affine(scale=(0.95, 1.05), translate_percent=(-0.03, 0.03), rotate=(-5, 5), shear=(-3, 3), border_mode=0, p=0.30),
+                A.CLAHE(clip_limit=2.0, p=0.15),
+                A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.15, p=0.35),
+                A.HueSaturationValue(hue_shift_limit=8, sat_shift_limit=12, val_shift_limit=12, p=0.30),
+                A.GaussNoise(p=0.08),
+                A.CoarseDropout(num_holes_range=(1, 4), hole_height_range=(6, 16), hole_width_range=(6, 16), p=0.10),
+            ]
+
+        transforms.extend([
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2()
+        ])
+        self.transform = A.Compose(
+            transforms,
+            bbox_params=A.BboxParams(format='pascal_voc', label_fields=['category_ids'], min_visibility=0.3)
+        )
+
+    def set_training_stage(self, stage):
+        self.training_stage = stage
+        self.mosaic_prob = 0.0 if stage == "fine" else self.base_mosaic_prob
+        self._build_transform()
+
+    def set_resolution(self, resolution):
+        self.resolution = resolution
+        self.grid_size = resolution // 16
+        self._build_transform()
 
     def __len__(self):
         return len(self.examples)
@@ -183,7 +205,7 @@ class DetectionDataset(Dataset):
 
     def __getitem__(self, idx):
         example = self.examples[idx]
-        if self.is_train and random.random() < 0.35:
+        if self.is_train and random.random() < self.mosaic_prob:
             img_np, bboxes, labels = self._load_mosaic(idx)
         else:
             img_np, bboxes, labels = self._load_raw_example(idx)
