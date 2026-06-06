@@ -128,16 +128,65 @@ class DetectionDataset(Dataset):
     def __len__(self):
         return len(self.examples)
 
-    def __getitem__(self, idx):
+    def _load_raw_example(self, idx):
         example = self.examples[idx]
         img_path = os.path.join(self.image_dir, os.path.basename(example['file_name']))
-        
-        # Load image and convert to NumPy Array
         img = Image.open(img_path).convert("RGB")
-        img_np = np.array(img)
-        
-        bboxes = list(example['bboxes'])  # List of [xmin, ymin, xmax, ymax]
-        labels = list(example['labels'])
+        return np.array(img), list(example['bboxes']), list(example['labels'])
+
+    def _load_mosaic(self, idx):
+        indices = [idx] + random.sample(range(len(self.examples)), 3)
+        out_size = self.resolution * 2
+        mosaic = np.full((out_size, out_size, 3), 114, dtype=np.uint8)
+        mosaic_boxes = []
+        mosaic_labels = []
+        placements = [
+            (0, 0, self.resolution, self.resolution),
+            (self.resolution, 0, out_size, self.resolution),
+            (0, self.resolution, self.resolution, out_size),
+            (self.resolution, self.resolution, out_size, out_size),
+        ]
+
+        for sample_idx, (x1_dst, y1_dst, x2_dst, y2_dst) in zip(indices, placements):
+            img, boxes, labels = self._load_raw_example(sample_idx)
+            h, w = img.shape[:2]
+            resized = np.array(Image.fromarray(img).resize((self.resolution, self.resolution), Image.BILINEAR))
+            mosaic[y1_dst:y2_dst, x1_dst:x2_dst] = resized
+
+            scale_x = self.resolution / max(w, 1)
+            scale_y = self.resolution / max(h, 1)
+            for box, label in zip(boxes, labels):
+                bx1, by1, bx2, by2 = box
+                nx1 = bx1 * scale_x + x1_dst
+                ny1 = by1 * scale_y + y1_dst
+                nx2 = bx2 * scale_x + x1_dst
+                ny2 = by2 * scale_y + y1_dst
+                if nx2 > nx1 and ny2 > ny1:
+                    mosaic_boxes.append([nx1, ny1, nx2, ny2])
+                    mosaic_labels.append(label)
+
+        crop_x = random.randint(0, self.resolution)
+        crop_y = random.randint(0, self.resolution)
+        cropped = mosaic[crop_y:crop_y + self.resolution, crop_x:crop_x + self.resolution]
+        cropped_boxes = []
+        cropped_labels = []
+        for box, label in zip(mosaic_boxes, mosaic_labels):
+            x1, y1, x2, y2 = box
+            x1 = max(0.0, min(float(self.resolution), x1 - crop_x))
+            y1 = max(0.0, min(float(self.resolution), y1 - crop_y))
+            x2 = max(0.0, min(float(self.resolution), x2 - crop_x))
+            y2 = max(0.0, min(float(self.resolution), y2 - crop_y))
+            if x2 - x1 >= 4 and y2 - y1 >= 4:
+                cropped_boxes.append([x1, y1, x2, y2])
+                cropped_labels.append(label)
+        return cropped, cropped_boxes, cropped_labels
+
+    def __getitem__(self, idx):
+        example = self.examples[idx]
+        if self.is_train and random.random() < 0.35:
+            img_np, bboxes, labels = self._load_mosaic(idx)
+        else:
+            img_np, bboxes, labels = self._load_raw_example(idx)
         
         # Apply Albumentations Compose Pipeline
         try:
