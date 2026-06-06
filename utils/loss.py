@@ -25,15 +25,31 @@ class DetectionLoss(nn.Module):
     - Weighted Cross Entropy for class probabilities.
     - Custom CIoU (Complete IoU) Loss + Activated Smooth L1 Loss for bounding boxes.
     """
-    def __init__(self, lambda_obj=5.0, lambda_noobj=0.5, lambda_class=1.0, lambda_box=3.0, class_weights=None):
+    def __init__(
+        self,
+        lambda_obj=5.0,
+        lambda_noobj=0.5,
+        lambda_class=1.0,
+        lambda_box=3.0,
+        class_weights=None,
+        hard_negative_ratio=20,
+        label_smoothing=0.05,
+        min_quality_target=0.10,
+    ):
         super(DetectionLoss, self).__init__()
         self.lambda_obj = lambda_obj
         self.lambda_noobj = lambda_noobj
         self.lambda_class = lambda_class
         self.lambda_box = lambda_box
+        self.hard_negative_ratio = hard_negative_ratio
+        self.min_quality_target = min_quality_target
         
         self.bce_logits = nn.BCEWithLogitsLoss(reduction='none')
-        self.ce_loss = nn.CrossEntropyLoss(weight=class_weights, reduction='sum')
+        self.ce_loss = nn.CrossEntropyLoss(
+            weight=class_weights,
+            reduction='sum',
+            label_smoothing=label_smoothing,
+        )
         self.smooth_l1 = nn.SmoothL1Loss(reduction='sum')
 
     def forward(self, predictions, targets):
@@ -57,20 +73,12 @@ class DetectionLoss(nn.Module):
         obj_mask = (target_obj == 1.0)
         noobj_mask = (target_obj == 0.0)
         
-        # 1. Objectness Loss (Focal Loss to handle extreme background cell imbalance)
-        loss_obj_all = focal_loss_with_logits(pred_obj, target_obj, alpha=0.25, gamma=2.0)
-        loss_obj = loss_obj_all[obj_mask].sum() if obj_mask.sum() > 0 else 0.0
-        loss_noobj = loss_obj_all[noobj_mask].sum()
-        
-        # Grid Normalization: scale objectness loss relative to standard 448x448 grid size (S=28, S^2=784)
-        grid_normalization = (S * S) / 784.0
-        total_obj_loss = (self.lambda_obj * loss_obj + self.lambda_noobj * loss_noobj) / grid_normalization
-        
         # Check if there are any objects in this batch
         num_pos = obj_mask.sum().item()
         if num_pos == 0:
-            # If no objects, return only background classification loss
-            return total_obj_loss / batch_size
+            noobj_losses = focal_loss_with_logits(pred_obj, target_obj, alpha=0.25, gamma=2.0).flatten()
+            keep = min(noobj_losses.numel(), batch_size * self.hard_negative_ratio)
+            return self.lambda_noobj * torch.topk(noobj_losses, keep).values.mean()
             
         # 2. Classification Loss (Cross Entropy Loss)
         # Extract class logits for grid cells containing objects
@@ -128,6 +136,21 @@ class DetectionLoss(nn.Module):
         
         # IoU
         iou = inter_area / union_area
+
+        # 1. IoU-aware objectness + online hard-negative mining.
+        # Good localized boxes receive higher confidence targets. Only the hardest
+        # background cells contribute, reducing easy-background domination.
+        quality_target = torch.zeros_like(target_obj)
+        quality_target[obj_mask] = iou.detach().clamp(min=self.min_quality_target, max=1.0)
+        loss_obj_all = focal_loss_with_logits(pred_obj, quality_target, alpha=0.25, gamma=2.0)
+        loss_obj = loss_obj_all[obj_mask].mean()
+        negative_losses = loss_obj_all[noobj_mask]
+        num_hard_negatives = min(
+            negative_losses.numel(),
+            max(num_pos * self.hard_negative_ratio, batch_size * self.hard_negative_ratio),
+        )
+        loss_noobj = torch.topk(negative_losses, num_hard_negatives).values.mean()
+        total_obj_loss = self.lambda_obj * loss_obj + self.lambda_noobj * loss_noobj
         
         # CIoU terms: distance regularization + aspect ratio similarity
         # 1. Square distance of box centers
@@ -167,5 +190,7 @@ class DetectionLoss(nn.Module):
         total_box_loss = (total_box_loss / num_pos) * (batch_size * avg_objs_per_image)
         
         # Combine all losses
-        loss = (total_obj_loss + self.lambda_class * total_class_loss + self.lambda_box * total_box_loss) / batch_size
+        loss = total_obj_loss + (
+            self.lambda_class * total_class_loss + self.lambda_box * total_box_loss
+        ) / batch_size
         return loss

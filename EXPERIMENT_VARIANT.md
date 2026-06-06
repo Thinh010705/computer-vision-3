@@ -7,6 +7,14 @@ This version keeps the original architecture and uses a staged augmentation sche
 
 The `384x384` scale was removed because experiment logs showed a consistent validation mAP drop after training at that resolution.
 
+Generalization-focused training improvements:
+
+- IoU-aware objectness: confidence targets reflect localization quality.
+- Online hard-negative mining: training focuses on confusing background cells instead of millions of easy negatives.
+- Mild classification label smoothing.
+- Square-root inverse-frequency class weights instead of aggressive raw inverse-frequency weights.
+- EMA model weights are used for validation and saved as `model_state_dict`.
+
 Recommended command:
 
 ```bash
@@ -21,5 +29,10 @@ python train.py \
   --lr 1e-3 \
   --mosaic_prob 0.15 \
   --close_mosaic_epochs 15 \
-  --fine_tune_lr_scale 0.25
+  --fine_tune_lr_scale 0.25 \
+  --ema_decay 0.9998 \
+  --hard_negative_ratio 20 \
+  --label_smoothing 0.05
 ```
+
+These changes are class-agnostic and do not use validation-specific per-class thresholds, so they are intended to transfer better to the hidden test set.

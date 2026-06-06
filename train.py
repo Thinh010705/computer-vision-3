@@ -1,5 +1,6 @@
 import os
 import argparse
+import copy
 import random
 import torch
 from torch.utils.data import DataLoader
@@ -34,6 +35,9 @@ def parse_args():
     parser.add_argument("--mosaic_prob", type=float, default=0.15, help="Mosaic probability during the strong augmentation phase")
     parser.add_argument("--close_mosaic_epochs", type=int, default=15, help="Disable mosaic and strong augmentation for final epochs")
     parser.add_argument("--fine_tune_lr_scale", type=float, default=0.25, help="Multiply LR when entering final fine-tune phase")
+    parser.add_argument("--ema_decay", type=float, default=0.9998, help="Exponential moving average decay for model weights")
+    parser.add_argument("--hard_negative_ratio", type=int, default=20, help="Hard background cells per positive object")
+    parser.add_argument("--label_smoothing", type=float, default=0.05, help="Classification label smoothing")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     return parser.parse_args()
 
@@ -66,6 +70,25 @@ def collate_fn(batch):
     targets = [item[1] for item in batch]
     metas = [item[2] for item in batch]
     return torch.stack(images, 0), torch.stack(targets, 0), metas
+
+
+class ModelEMA:
+    """Exponential moving average of model weights for more stable evaluation."""
+    def __init__(self, model, decay=0.9998):
+        self.ema = copy.deepcopy(model).eval()
+        self.decay = decay
+        for parameter in self.ema.parameters():
+            parameter.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model):
+        model_state = model.state_dict()
+        for name, ema_value in self.ema.state_dict().items():
+            model_value = model_state[name].detach()
+            if ema_value.dtype.is_floating_point:
+                ema_value.mul_(self.decay).add_(model_value, alpha=1.0 - self.decay)
+            else:
+                ema_value.copy_(model_value)
 
 def evaluate_map(model, val_loader, device, conf_threshold=0.05, iou_threshold=0.5):
     """
@@ -224,14 +247,19 @@ def train(args):
     # 4. Instantiate Model, Loss, Optimizer, and Cosine Scheduler
     model = ResNetYOLO(pretrained=not args.no_pretrained).to(device)
     
-    # Compute inverse frequency class weights to combat extreme class imbalance
+    # Square-root inverse frequency is less aggressive than raw inverse frequency,
+    # improving calibration and reducing overfitting to rare-class validation noise.
     # Frequency counts: person: 5829, car: 1339, dog: 1028, cat: 833, chair: 1613
     # Absolute counts sum to 10642 annotations. Inverse frequency weights are:
-    class_weights = torch.tensor([1.83, 7.95, 10.35, 12.78, 6.60], dtype=torch.float32).to(device)
+    class_weights = torch.tensor([1.83, 7.95, 10.35, 12.78, 6.60], dtype=torch.float32).sqrt().to(device)
     # Normalize weights so that their mean is 1.0 (sums to num_classes = 5)
     class_weights = class_weights / class_weights.sum() * 5.0
     
-    criterion = DetectionLoss(class_weights=class_weights).to(device)
+    criterion = DetectionLoss(
+        class_weights=class_weights,
+        hard_negative_ratio=args.hard_negative_ratio,
+        label_smoothing=args.label_smoothing,
+    ).to(device)
     
     # Differential Learning Rates: fine-tune backbone 10x slower than the head
     backbone_params = []
@@ -256,13 +284,15 @@ def train(args):
         except TypeError:
             checkpoint = torch.load(args.resume, map_location=device)
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            model.load_state_dict(checkpoint["model_state_dict"])
+            model.load_state_dict(checkpoint.get("raw_model_state_dict", checkpoint["model_state_dict"]))
             if "optimizer_state_dict" in checkpoint:
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             start_epoch = int(checkpoint.get("epoch", -1)) + 1
             resume_best_map = float(checkpoint.get("mAP", 0.0))
         else:
             model.load_state_dict(checkpoint)
+
+    model_ema = ModelEMA(model, decay=args.ema_decay)
     
     # Cosine learning rate decay for smooth convergence
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -340,6 +370,7 @@ def train(args):
             
             scaler.step(optimizer)
             scaler.update()
+            model_ema.update(model)
             
             epoch_loss += loss.item()
             progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
@@ -349,7 +380,7 @@ def train(args):
         
         # 6. Evaluation Phase
         print(f"Calculating Validation mAP@0.5...")
-        val_map = evaluate_map(model, val_loader, device, conf_threshold=args.conf_threshold, iou_threshold=args.iou_threshold)
+        val_map = evaluate_map(model_ema.ema, val_loader, device, conf_threshold=args.conf_threshold, iou_threshold=args.iou_threshold)
         
         print(f"Epoch {epoch+1} Summary: Avg Train Loss = {avg_train_loss:.4f} | Val mAP@0.5 = {val_map:.4f}")
         
@@ -359,7 +390,8 @@ def train(args):
             best_path = os.path.join(args.checkpoint_dir, "best.pth")
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': model.state_dict(),
+                'model_state_dict': model_ema.ema.state_dict(),
+                'raw_model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'mAP': val_map,
                 'conf_threshold': args.conf_threshold,
@@ -371,7 +403,8 @@ def train(args):
         latest_path = os.path.join(args.checkpoint_dir, "latest.pth")
         torch.save({
             'epoch': epoch,
-            'model_state_dict': model.state_dict(),
+            'model_state_dict': model_ema.ema.state_dict(),
+            'raw_model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'mAP': val_map,
             'conf_threshold': args.conf_threshold,
