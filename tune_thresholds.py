@@ -9,7 +9,7 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 from tqdm import tqdm
 
-from predict import flip_boxes_back, load_models
+from predict import load_models, parse_sizes, predict_image_boxes
 from train import compute_ap
 from utils.nms import bbox_iou, decode_predictions, non_maximum_suppression
 
@@ -29,6 +29,7 @@ def parse_args():
     parser.add_argument("--conf_values", default="0.03,0.05,0.08,0.10,0.15,0.20,0.25,0.30")
     parser.add_argument("--iou_values", default="0.40,0.45,0.50,0.55,0.60,0.65")
     parser.add_argument("--tta_flip", action="store_true")
+    parser.add_argument("--tta_sizes", default="448", help="Comma-separated inference sizes")
     return parser.parse_args()
 
 
@@ -43,7 +44,7 @@ def load_validation(annotation_path):
 
 
 @torch.no_grad()
-def predict_raw_for_val(images, image_dir, models, min_conf, use_tta, device):
+def predict_raw_for_val(images, image_dir, models, min_conf, use_tta, tta_sizes, device):
     normalize = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     predictions = {}
     for info in tqdm(images, desc="Collecting predictions"):
@@ -53,18 +54,9 @@ def predict_raw_for_val(images, image_dir, models, min_conf, use_tta, device):
             path = os.path.join(image_dir, os.path.basename(info["file_name"]))
         img = Image.open(path).convert("RGB")
         w_orig, h_orig = img.size
-        img_resized = img.resize((448, 448), Image.BILINEAR)
-        img_tensor = normalize(TF.to_tensor(img_resized)).unsqueeze(0).to(device)
-
-        boxes = []
-        for model in models:
-            output = model(img_tensor)
-            boxes.extend(decode_predictions(output[0], w_orig, h_orig, conf_threshold=min_conf))
-            if use_tta:
-                flipped_output = model(torch.flip(img_tensor, dims=[3]))
-                flipped_boxes = decode_predictions(flipped_output[0], w_orig, h_orig, conf_threshold=min_conf)
-                boxes.extend(flip_boxes_back(flipped_boxes, w_orig))
-        predictions[filename] = boxes
+        predictions[filename] = predict_image_boxes(
+            models, img, min_conf, use_tta, tta_sizes, normalize, device
+        )
     return predictions
 
 
@@ -126,8 +118,11 @@ def main():
     models = load_models(args.checkpoint, device)
     conf_values = parse_float_list(args.conf_values)
     iou_values = parse_float_list(args.iou_values)
+    tta_sizes = parse_sizes(args.tta_sizes)
     images, gt_by_image = load_validation(args.val_data)
-    raw_predictions = predict_raw_for_val(images, args.val_image_dir, models, min(conf_values), args.tta_flip, device)
+    raw_predictions = predict_raw_for_val(
+        images, args.val_image_dir, models, min(conf_values), args.tta_flip, tta_sizes, device
+    )
 
     best = (-1.0, None, None)
     for conf in conf_values:

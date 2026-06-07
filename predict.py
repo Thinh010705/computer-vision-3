@@ -18,6 +18,7 @@ def parse_args():
     parser.add_argument("--conf_threshold", type=float, default=0.05, help="Confidence threshold")
     parser.add_argument("--iou_threshold", type=float, default=0.50, help="IoU threshold for NMS")
     parser.add_argument("--tta_flip", action="store_true", help="Run horizontal flip test-time augmentation")
+    parser.add_argument("--tta_sizes", default="448", help="Comma-separated inference sizes, e.g. 416,448,480")
     parser.add_argument("--max_detections", type=int, default=100, help="Maximum detections per image")
     return parser.parse_args()
 
@@ -66,6 +67,35 @@ def flip_boxes_back(boxes, img_width):
 def limit_detections(boxes, max_detections):
     return sorted(boxes, key=lambda b: b["confidence"], reverse=True)[:max_detections]
 
+
+def parse_sizes(value):
+    sizes = [int(item.strip()) for item in value.split(",") if item.strip()]
+    if not sizes or any(size <= 0 or size % 32 != 0 for size in sizes):
+        raise ValueError("TTA sizes must be positive multiples of 32.")
+    return sizes
+
+
+def prepare_image(img, size, normalize, device):
+    resized = img.resize((size, size), Image.BILINEAR)
+    return normalize(TF.to_tensor(resized)).unsqueeze(0).to(device)
+
+
+@torch.no_grad()
+def predict_image_boxes(models, img, conf_threshold, tta_flip, tta_sizes, normalize, device):
+    w_orig, h_orig = img.size
+    raw_boxes = []
+    for size in tta_sizes:
+        img_tensor = prepare_image(img, size, normalize, device)
+        for model in models:
+            output = model(img_tensor)
+            raw_boxes.extend(decode_predictions(output[0], w_orig, h_orig, conf_threshold=conf_threshold))
+            if tta_flip:
+                flipped_output = model(torch.flip(img_tensor, dims=[3]))
+                flipped_boxes = decode_predictions(flipped_output[0], w_orig, h_orig, conf_threshold=conf_threshold)
+                raw_boxes.extend(flip_boxes_back(flipped_boxes, w_orig))
+    return raw_boxes
+
+
 def main():
     args = parse_args()
     
@@ -75,6 +105,7 @@ def main():
     
     # 2. Instantiate and Load Model(s). Multiple checkpoints are ensembled by box merging + NMS.
     models = load_models(args.checkpoint, device)
+    tta_sizes = parse_sizes(args.tta_sizes)
     
     # Image Net normalization transforms
     normalize = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -95,32 +126,15 @@ def main():
                 img = Image.open(img_path).convert("RGB")
                 w_orig, h_orig = img.size
                 
-                # Resize and pre-process image
-                # Standard input size for optimal GPU model is 448x448
-                img_resized = img.resize((448, 448), Image.BILINEAR)
-                img_tensor = TF.to_tensor(img_resized)
-                img_tensor = normalize(img_tensor).unsqueeze(0).to(device)
-                
-                raw_boxes = []
-                for model in models:
-                    output = model(img_tensor)  # (1, 10, 28, 28) for 448 input with stride 16
-                    raw_boxes.extend(decode_predictions(
-                        output[0],
-                        w_orig,
-                        h_orig,
-                        conf_threshold=args.conf_threshold
-                    ))
-
-                    if args.tta_flip:
-                        flipped_tensor = torch.flip(img_tensor, dims=[3])
-                        flipped_output = model(flipped_tensor)
-                        flipped_boxes = decode_predictions(
-                            flipped_output[0],
-                            w_orig,
-                            h_orig,
-                            conf_threshold=args.conf_threshold
-                        )
-                        raw_boxes.extend(flip_boxes_back(flipped_boxes, w_orig))
+                raw_boxes = predict_image_boxes(
+                    models,
+                    img,
+                    args.conf_threshold,
+                    args.tta_flip,
+                    tta_sizes,
+                    normalize,
+                    device,
+                )
                 
                 # Apply class-wise NMS
                 final_boxes = limit_detections(non_maximum_suppression(

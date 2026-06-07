@@ -1,85 +1,342 @@
-# Mô hình Phát hiện Đối tượng Anchor-Free từ đầu với Backbone ResNet-50 & FPN (ResNetYOLO)
+# Phát hiện đối tượng Anchor-Free với ConvNeXt-Tiny và FPN tự cài đặt
 
-Mô hình **ResNetYOLO** được xây dựng và tối ưu hóa tối đa nhằm mục đích phát hiện đối tượng từ đầu (Object Detection from scratch) trên GPU T4 của nền tảng **Lightning AI** (hoặc các GPU NVIDIA khác). Mô hình sử dụng mạng trích xuất đặc trưng `ResNet-50` mạnh mẽ kết hợp cùng **bộ đầu FPN (Feature Pyramid Network)** dung hợp đặc trưng đa quy mô (stride-16 và stride-32) cho ra lưới dự đoán mịn gấp đôi (**$28 \times 28$**), hàm mất mát tối tân **CIoU Loss**, tăng cường dữ liệu nhiều kích thước (**Multi-Scale Training**) và tăng tốc huấn luyện bằng **Độ chính xác hỗn hợp (Mixed Precision - AMP)**.
+Dự án xây dựng một detector anchor-free cho 5 lớp:
 
----
-
-## 📂 Cấu trúc Thư mục Nộp bài
-
+```text
+person, car, dog, cat, chair
 ```
-<my_submission>/
+
+Phần phát hiện đối tượng được cài đặt trực tiếp bằng PyTorch: tạo target lưới, detection heads, hàm mất mát, giải mã hộp bao, confidence filtering và class-wise NMS. Dự án không sử dụng detector hoàn chỉnh như YOLOv5/v8, Detectron2, MMDetection, Faster R-CNN hoặc SSD có sẵn.
+
+Backbone `ConvNeXt-Tiny` pretrained ImageNet được sử dụng làm mạng trích xuất đặc trưng. Điều này phù hợp với quy định cho phép dùng backbone đã huấn luyện trước; toàn bộ detection pipeline phía sau backbone vẫn được tự cài đặt.
+
+> `ResNetYOLO` là tên lớp giữ lại từ phiên bản đầu. Kiến trúc thực tế trong `models/detector.py` sử dụng ConvNeXt-Tiny, không phải ResNet-50.
+
+## Kết quả đã đo
+
+Kết quả trên tập validation bằng công cụ chấm chính thức:
+
+```text
+mAP@0.5:         0.778076
+Performance:     20/20
+Micro recall:    0.914399
+Micro precision: 0.110269
+```
+
+Kết quả trên được tạo bằng checkpoint tốt nhất đã lưu, threshold đã tune và TTA lật ngang. Các thử nghiệm làm thay đổi mạnh loss đã được loại bỏ vì làm giảm mAP; phiên bản hiện tại giữ loss baseline đã chứng minh hiệu quả và bổ sung các kỹ thuật inference/checkpoint ít rủi ro.
+
+## Cấu trúc dự án
+
+```text
+<submission>/
+├── public/
 ├── models/
-│   ├── __init__.py
-│   └── detector.py            # Định nghĩa kiến trúc mô hình (ResNet-50 + FPN Fusion)
+│   ├── detector.py          # ConvNeXt-Tiny, FPN fusion và decoupled heads
+│   └── best.pth             # Checkpoint tốt nhất theo validation mAP@0.5
 ├── utils/
-│   ├── __init__.py
-│   ├── dataset.py             # Bộ đọc dữ liệu nâng cao, Augmentations & Multi-Scale
-│   ├── loss.py                # Hàm mất mát tùy chỉnh CIoU Loss + Smooth L1 + Focal Loss
-│   └── nms.py                 # Giải mã hộp bao & thuật toán Class-wise NMS
-├── train.py                   # Script huấn luyện chính trên GPU (AMP + Cosine Decay + LR vi sai)
-├── predict.py                 # Script chạy suy luận chuẩn định dạng đầu ra
-├── README.md                  # Tài liệu hướng dẫn sử dụng (tệp tin này)
-└── requirements.txt           # Danh sách các thư viện Python cần thiết
+│   ├── dataset.py           # Đọc JSON, augment, mosaic và sinh target lưới
+│   ├── loss.py              # Focal objectness, weighted CE, CIoU và Smooth L1
+│   └── nms.py               # Decode bbox, IoU và class-wise NMS tự cài đặt
+├── train.py                 # Train, AMP, staged augmentation, top-k checkpoint và validation mAP
+├── predict.py               # Suy luận, flip/multi-scale TTA, ensemble và predictions.json
+├── tune_thresholds.py       # Tìm confidence/NMS threshold tốt nhất trên validation
+├── average_checkpoints.py   # Tạo model soup bằng trung bình trọng số
+├── EXPERIMENT_VARIANT.md
+├── README.md
+└── requirements.txt
 ```
 
----
+## Kiến trúc mô hình
 
-## 🚀 Hướng dẫn Thiết lập và Sử dụng trên Lightning AI (GPU T4)
+### Backbone và FPN
 
-### Bước 1: Cài đặt Môi trường
-Sau khi mở Studio hoặc Terminal trên Lightning AI (chọn cấu hình GPU T4), hãy chạy lệnh sau để cài đặt đầy đủ các thư viện phụ thuộc:
+Ảnh được chuẩn hóa theo ImageNet và đưa qua `ConvNeXt-Tiny`:
+
+```text
+Ảnh đầu vào
+    ↓
+ConvNeXt-Tiny pretrained ImageNet
+    ├── feature stride 16, 384 channels
+    └── feature stride 32, 768 channels
+              ↓
+       projection 1x1 + upsample
+              ↓
+       FPN feature fusion
+              ↓
+       feature stride 16
+```
+
+Với ảnh `448×448`, feature cuối có kích thước `28×28`.
+
+### Detection heads
+
+Mô hình sử dụng hai nhánh dự đoán tách biệt:
+
+- Classification head: `objectness + 5 class logits`.
+- Regression head: `x, y, width, height`.
+
+Mỗi cell dự đoán tối đa một đối tượng. Đầu ra có dạng:
+
+```text
+[objectness, class_1 ... class_5, x, y, w, h]
+```
+
+### Hàm mất mát
+
+Loss được tự cài đặt và gồm:
+
+- Focal Loss cho objectness.
+- Weighted Cross Entropy với class weights cho phân lớp.
+- CIoU Loss và Smooth L1 cho hồi quy hộp bao.
+
+Class weights sử dụng inverse-frequency như cấu hình baseline đạt mAP tốt nhất.
+
+## Quy trình dữ liệu
+
+Dataset đọc trực tiếp `train.json` và `val.json`, hỗ trợ nhiều đối tượng trong một ảnh và tạo target lưới stride 16.
+
+Huấn luyện sử dụng staged augmentation:
+
+### Giai đoạn đầu
+
+- Horizontal flip.
+- Mosaic 4 ảnh với xác suất mặc định `0.15`.
+- Random resized crop nhẹ.
+- Affine nhẹ.
+- Brightness, contrast, hue và saturation.
+- Noise và cutout nhẹ.
+- Multi-scale training ở `416`, `448`, `480`.
+
+### Giai đoạn cuối
+
+Trong 15 epoch cuối:
+
+- Tắt mosaic.
+- Cố định kích thước `448×448`.
+- Chỉ giữ augmentation nhẹ.
+- Giảm learning rate để fine-tune trên phân phối gần ảnh thật.
+
+Resolution `384×384` đã được loại bỏ vì các thí nghiệm cho thấy nó làm giảm validation mAP đáng kể.
+
+## Cài đặt môi trường
+
 ```bash
 pip install -r requirements.txt
+pip install albumentations
 ```
 
-### Bước 2: Huấn luyện Mô hình
-Chạy lệnh huấn luyện bắt buộc sau để bắt đầu tối ưu hóa mô hình. Quá trình này sẽ sử dụng Mixed Precision (AMP) giúp chạy cực kỳ nhanh và lưu checkpoint tốt nhất vào thư mục `./models/best.pth`.
+Khuyến nghị sử dụng GPU NVIDIA hỗ trợ CUDA. Code vẫn có thể chạy trên CPU nhưng quá trình huấn luyện sẽ chậm.
+
+## Huấn luyện
+
+### Lệnh bắt buộc
+
 ```bash
 python train.py \
   --train_data ./public/annotations/train.json \
   --val_data ./public/annotations/val.json \
   --image_dir ./public/train/images \
   --val_image_dir ./public/val/images \
-  --checkpoint_dir ./models/ \
-  --epochs 50 \
-  --batch_size 32 \
-  --lr 1e-3
+  --checkpoint_dir ./models/
 ```
-*Lưu ý:* Mặc định tham số `--multi_scale` được kích hoạt để huấn luyện mô hình ở nhiều độ phân giải khác nhau từ $384 \times 384$ đến $480 \times 480$ pixel, tạo ra độ bền vững tuyệt đối cho kết quả.
 
-### Bước 3: Chạy Suy luận (Inference)
-Sử dụng mô hình tốt nhất đã được huấn luyện để tạo ra tệp dự đoán `predictions.json` trên tập ảnh bất kỳ bằng lệnh bắt buộc sau:
+### Cấu hình khuyến nghị
+
+```bash
+python train.py \
+  --train_data ./public/annotations/train.json \
+  --val_data ./public/annotations/val.json \
+  --image_dir ./public/train/images \
+  --val_image_dir ./public/val/images \
+  --checkpoint_dir ./models_generalized/ \
+  --epochs 60 \
+  --batch_size 32 \
+  --lr 1e-3 \
+  --mosaic_prob 0.15 \
+  --close_mosaic_epochs 15 \
+  --fine_tune_lr_scale 0.25 \
+  --save_top_k 5
+```
+
+Checkpoint được lưu:
+
+```text
+models_generalized/best.pth    # validation mAP tốt nhất
+models_generalized/latest.pth  # Checkpoint mới nhất
+models_generalized/epoch_*.pth # top-k checkpoint để ensemble/model soup
+```
+
+Mặc định backbone dùng trọng số ImageNet. Để khởi tạo toàn bộ mô hình ngẫu nhiên:
+
+```bash
+python train.py ... --no_pretrained
+```
+
+Để tiếp tục train từ checkpoint:
+
+```bash
+python train.py ... --resume ./models/best.pth
+```
+
+## Tune confidence và NMS
+
+`tune_thresholds.py` thử nhiều cặp confidence/NMS threshold trên validation. Script không thay đổi trọng số mô hình.
+
+Tune không dùng TTA:
+
+```bash
+python tune_thresholds.py \
+  --val_data ./public/annotations/val.json \
+  --val_image_dir ./public/val/images \
+  --checkpoint ./models/best.pth
+```
+
+Tune với TTA lật ngang:
+
+```bash
+python tune_thresholds.py \
+  --val_data ./public/annotations/val.json \
+  --val_image_dir ./public/val/images \
+  --checkpoint ./models/best.pth \
+  --tta_flip
+```
+
+Tune với multi-scale TTA:
+
+```bash
+python tune_thresholds.py \
+  --val_data ./public/annotations/val.json \
+  --val_image_dir ./public/val/images \
+  --checkpoint ./models/best.pth \
+  --tta_sizes 416,448,480 \
+  --tta_flip
+```
+
+Trong thí nghiệm hiện tại:
+
+```text
+Không TTA flip: mAP@0.5 = 0.7713
+Có TTA flip:    mAP@0.5 = 0.7781
+```
+
+Vì vậy TTA flip được khuyến nghị cho checkpoint hiện tại. Khi predict hidden test, phải sử dụng cùng TTA và threshold đã tune.
+
+## Suy luận
+
+### Lệnh bắt buộc
+
+```bash
+python predict.py \
+  --image_dir /path/to/images \
+  --output predictions.json
+```
+
+### Cấu hình khuyến nghị
+
+Thay `<best_conf>` và `<best_iou>` bằng kết quả từ `tune_thresholds.py`:
+
+```bash
+python predict.py \
+  --image_dir /path/to/images \
+  --output predictions.json \
+  --checkpoint ./models/best.pth \
+  --conf_threshold <best_conf> \
+  --iou_threshold <best_iou> \
+  --tta_flip
+```
+
+`predict.py` hỗ trợ ensemble nhiều checkpoint:
+
+```bash
+python predict.py \
+  --image_dir /path/to/images \
+  --output predictions.json \
+  --checkpoint ./models/model_a.pth ./models/model_b.pth \
+  --tta_flip
+```
+
+Prediction của ảnh gốc, ảnh lật và các checkpoint được gộp trước khi chạy class-wise NMS.
+
+Multi-scale TTA chạy cùng model ở nhiều kích thước:
+
+```bash
+python predict.py \
+  --image_dir /path/to/images \
+  --output predictions_multiscale.json \
+  --checkpoint ./models/best.pth \
+  --tta_sizes 416,448,480 \
+  --tta_flip
+```
+
+Multi-scale TTA chậm hơn đáng kể, vì vậy chỉ sử dụng nếu evaluator chính thức cho kết quả cao hơn.
+
+## Model soup
+
+`train.py` giữ lại top-k checkpoint tốt nhất. Có thể trung bình trọng số của các checkpoint có mAP gần nhau:
+
+```bash
+python average_checkpoints.py \
+  --checkpoints \
+    ./models/epoch_039_map_0.75xx.pth \
+    ./models/epoch_043_map_0.76xx.pth \
+    ./models/epoch_047_map_0.75xx.pth \
+  --output ./models/model_soup.pth
+```
+
+Sau đó tune và đánh giá `model_soup.pth` như checkpoint bình thường. Không nên trộn checkpoint có mAP quá thấp hoặc đến từ kiến trúc khác.
+
+## Đánh giá bằng công cụ chính thức
+
+Tạo prediction trên validation:
+
 ```bash
 python predict.py \
   --image_dir ./public/val/images \
   --output predictions.json \
-  --checkpoint ./models/best.pth
+  --checkpoint ./models/best.pth \
+  --conf_threshold <best_conf> \
+  --iou_threshold <best_iou> \
+  --tta_flip
 ```
 
-### Bước 4: Tự chấm điểm và Đánh giá (mAP@0.5)
-Bạn có thể kiểm tra trực tiếp chất lượng của kết quả vừa dự đoán trên tập kiểm định để đo lường điểm số bằng script đánh giá được cung cấp:
+Chấm bằng evaluator:
+
 ```bash
 python public/tools/evaluate_predictions.py \
   --ground_truth ./public/annotations/val.json \
   --predictions predictions.json \
   --output score.json
 ```
-Xem nội dung tệp `score.json` để biết điểm số mAP@0.5 thực tế đạt được của mô hình!
 
----
+Điểm trong `score.json` là kết quả gần nhất với cách hệ thống chấm hidden test. mAP hiển thị trong `train.py` chủ yếu dùng để chọn checkpoint tốt nhất.
 
-## 🛠️ Điểm nhấn Công nghệ của Giải pháp
+## Định dạng predictions.json
 
-1. **Kiến trúc FPN Dung hợp Đa quy mô & Lưới Mịn ($28 \times 28$):**
-   * Sử dụng **ResNet-50** kết hợp cấu trúc **FPN (Feature Pyramid Network)** dung hợp đặc trưng Stride-16 (`layer3`) và Stride-32 (`layer4`) để tạo ra bản đồ đặc trưng giàu ngữ nghĩa và sắc nét về không gian.
-   * Lưới dự đoán nâng lên **$28 \times 28$** (784 ô lưới), giúp phát hiện xuất sắc các vật thể nhỏ và crowded ở cự ly xa (như `chair` và `car`).
-2. **Hàm mất mát Focal Loss & CIoU Loss:**
-   * Tự triển khai **CIoU Loss (Complete IoU)** tối ưu hóa trực tiếp độ trùng khớp, khoảng cách tâm và tỉ lệ khung hình.
-   * Sử dụng **Focal Loss** cho Objectness để cân bằng triệt để sự mất cân xứng tiền cảnh/hậu cảnh của lưới $28 \times 28$ (tỉ lệ 1:100).
-   * Tích hợp **Trọng số phân phối lớp** để giải quyết mất cân bằng nhãn.
-3. **Tăng cường dữ liệu nhiều kích thước (Multi-Scale Training):**
-   * Huấn luyện co dãn kích thước động từ $384$ đến $480$ pixel giúp mô hình có tính bất biến tỷ lệ (scale invariant).
-4. **Tốc độ học vi sai (Differential Learning Rates):**
-   * Backbone ResNet-50 chạy với learning rate $1e-4$ cực nhỏ, trong khi FPN và Custom Head chạy với learning rate $1e-3$ để tối ưu hóa hiệu năng tốt nhất.
-5. **AMP & NMS:**
-   * Tăng tốc Mixed Precision FP16 bằng `torch.amp` (không cảnh báo) và áp dụng Class-wise NMS để triệt tiêu hộp bao trùng lặp một cách tối ưu.
+```json
+[
+  {
+    "image_id": "img_7fd91a4c2e30.jpg",
+    "boxes": [
+      {
+        "class": "person",
+        "confidence": 0.91,
+        "bbox": [48, 72, 210, 356]
+      }
+    ]
+  }
+]
+```
+
+- `image_id`: tên file ảnh.
+- `class`: một trong 5 lớp quy định.
+- `confidence`: thuộc `[0, 1]`.
+- `bbox`: `[xmin, ymin, xmax, ymax]` theo tọa độ ảnh gốc.
+- Ảnh không có detection vẫn được xuất với `"boxes": []`.
+
+## Lưu ý khi so sánh mô hình
+
+- Giữ checkpoint đạt `0.778076` làm baseline an toàn.
+- Train các cải tiến mới vào thư mục checkpoint khác.
+- So sánh bằng cùng evaluator, cùng TTA và cùng quy trình tune threshold.
+- Không chọn model chỉ vì một lớp tăng; ưu tiên tổng mAP và độ ổn định qua nhiều epoch.
+- Hidden test có thể khác validation, vì vậy không sử dụng threshold riêng theo lớp hoặc các điều chỉnh quá sát validation.
