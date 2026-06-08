@@ -1,4 +1,4 @@
-# Phát hiện đối tượng Anchor-Free với ConvNeXt-Tiny và FPN tự cài đặt
+# Phát hiện đối tượng Anchor-Free đa tỉ lệ với ConvNeXt và FPN tự cài đặt
 
 Dự án xây dựng một detector anchor-free cho 5 lớp:
 
@@ -8,13 +8,27 @@ person, car, dog, cat, chair
 
 Phần phát hiện đối tượng được cài đặt trực tiếp bằng PyTorch: tạo target lưới, detection heads, hàm mất mát, giải mã hộp bao, confidence filtering và class-wise NMS. Dự án không sử dụng detector hoàn chỉnh như YOLOv5/v8, Detectron2, MMDetection, Faster R-CNN hoặc SSD có sẵn.
 
-Backbone `ConvNeXt-Tiny` pretrained ImageNet được sử dụng làm mạng trích xuất đặc trưng. Điều này phù hợp với quy định cho phép dùng backbone đã huấn luyện trước; toàn bộ detection pipeline phía sau backbone vẫn được tự cài đặt.
+Backbone `ConvNeXt-Tiny` hoặc `ConvNeXt-Small` pretrained ImageNet được sử dụng làm mạng trích xuất đặc trưng. Điều này phù hợp với quy định cho phép dùng backbone đã huấn luyện trước; toàn bộ detection pipeline phía sau backbone vẫn được tự cài đặt.
 
-> `ResNetYOLO` là tên lớp giữ lại từ phiên bản đầu. Kiến trúc thực tế trong `models/detector.py` sử dụng ConvNeXt-Tiny, không phải ResNet-50.
+> `ResNetYOLO` là tên lớp giữ lại từ phiên bản đầu. Kiến trúc thực tế trong `models/detector.py` sử dụng ConvNeXt, không phải ResNet-50.
 
-## Kết quả đã đo
+## Nâng cấp kiến trúc hiện tại
 
-Kết quả trên tập validation bằng công cụ chấm chính thức:
+Phiên bản mới giải quyết hai giới hạn lớn của detector stride-16 cũ:
+
+- Thêm ba detection head anchor-free tại stride `8/16/32`.
+- Mỗi ground-truth box được gán vào scale chính và một scale lân cận, tạo nhiều positive supervision và giảm xung đột cùng cell.
+- Head stride 8 ưu tiên vật thể nhỏ như `chair` và `car` ở xa.
+- Head stride 32 cung cấp receptive field phù hợp vật thể lớn.
+- Hỗ trợ chọn `--backbone tiny` hoặc `--backbone small`.
+- Checkpoint lưu `model_config`; `predict.py` tự dựng đúng backbone khi load.
+- Fallback augmentation giữ lại box thay vì biến ảnh có vật thể thành background.
+
+Kiến trúc mới không tương thích trực tiếp với checkpoint stride-16 cũ. Hãy giữ checkpoint baseline để đối chứng và train bản mới vào thư mục riêng, ví dụ `./models_p3p5/`.
+
+## Kết quả baseline đã đo
+
+Kết quả của phiên bản stride-16 trước khi nâng cấp, đo trên validation bằng công cụ chấm chính thức:
 
 ```text
 mAP@0.5:         0.778076
@@ -23,7 +37,7 @@ Micro recall:    0.914399
 Micro precision: 0.110269
 ```
 
-Kết quả trên được tạo bằng checkpoint tốt nhất đã lưu, threshold đã tune và TTA lật ngang. Các thử nghiệm làm thay đổi mạnh loss đã được loại bỏ vì làm giảm mAP; phiên bản hiện tại giữ loss baseline đã chứng minh hiệu quả và bổ sung các kỹ thuật inference/checkpoint ít rủi ro.
+Kết quả trên là mốc đối chứng cần vượt qua. Kiến trúc P3/P4/P5 mới cần được train lại và đánh giá bằng cùng evaluator, threshold tuning và TTA để xác định mức cải thiện thực tế.
 
 ## Cấu trúc dự án
 
@@ -31,7 +45,7 @@ Kết quả trên được tạo bằng checkpoint tốt nhất đã lưu, thres
 <submission>/
 ├── public/
 ├── models/
-│   ├── detector.py          # ConvNeXt-Tiny, FPN fusion và decoupled heads
+│   ├── detector.py          # ConvNeXt, FPN P3/P4/P5 và decoupled heads
 │   └── best.pth             # Checkpoint tốt nhất theo validation mAP@0.5
 ├── utils/
 │   ├── dataset.py           # Đọc JSON, augment, mosaic và sinh target lưới
@@ -48,25 +62,24 @@ Kết quả trên được tạo bằng checkpoint tốt nhất đã lưu, thres
 
 ## Kiến trúc mô hình
 
-### Backbone và FPN
+### Backbone và FPN đa tỉ lệ
 
 Ảnh được chuẩn hóa theo ImageNet và đưa qua `ConvNeXt-Tiny`:
 
 ```text
 Ảnh đầu vào
     ↓
-ConvNeXt-Tiny pretrained ImageNet
+ConvNeXt-Tiny/Small pretrained ImageNet
+    ├── feature stride 8,  192 channels
     ├── feature stride 16, 384 channels
     └── feature stride 32, 768 channels
               ↓
-       projection 1x1 + upsample
+       FPN top-down fusion
               ↓
-       FPN feature fusion
-              ↓
-       feature stride 16
+       heads stride 8 / 16 / 32
 ```
 
-Với ảnh `448×448`, feature cuối có kích thước `28×28`.
+Với ảnh `448×448`, ba lưới đầu ra có kích thước `56×56`, `28×28` và `14×14`.
 
 ### Detection heads
 
@@ -75,7 +88,7 @@ Mô hình sử dụng hai nhánh dự đoán tách biệt:
 - Classification head: `objectness + 5 class logits`.
 - Regression head: `x, y, width, height`.
 
-Mỗi cell dự đoán tối đa một đối tượng. Đầu ra có dạng:
+Mỗi cell trên mỗi scale dự đoán tối đa một đối tượng. Đầu ra mỗi scale có dạng:
 
 ```text
 [objectness, class_1 ... class_5, x, y, w, h]
@@ -93,7 +106,7 @@ Class weights sử dụng inverse-frequency như cấu hình baseline đạt mAP
 
 ## Quy trình dữ liệu
 
-Dataset đọc trực tiếp `train.json` và `val.json`, hỗ trợ nhiều đối tượng trong một ảnh và tạo target lưới stride 16.
+Dataset đọc trực tiếp `train.json` và `val.json`, hỗ trợ nhiều đối tượng trong một ảnh và tạo target cho ba lưới stride `8/16/32`. Mỗi đối tượng được gán vào hai scale phù hợp để tăng positive supervision và giảm mất nhãn do nhiều tâm rơi vào cùng cell.
 
 Huấn luyện sử dụng staged augmentation:
 
@@ -122,7 +135,6 @@ Resolution `384×384` đã được loại bỏ vì các thí nghiệm cho thấ
 
 ```bash
 pip install -r requirements.txt
-pip install albumentations
 ```
 
 Khuyến nghị sử dụng GPU NVIDIA hỗ trợ CUDA. Code vẫn có thể chạy trên CPU nhưng quá trình huấn luyện sẽ chậm.
@@ -148,10 +160,11 @@ python train.py \
   --val_data ./public/annotations/val.json \
   --image_dir ./public/train/images \
   --val_image_dir ./public/val/images \
-  --checkpoint_dir ./models_generalized/ \
+  --checkpoint_dir ./models_p3p5/ \
   --epochs 60 \
-  --batch_size 32 \
+  --batch_size 16 \
   --lr 1e-3 \
+  --backbone tiny \
   --mosaic_prob 0.15 \
   --close_mosaic_epochs 15 \
   --fine_tune_lr_scale 0.25 \
@@ -161,9 +174,9 @@ python train.py \
 Checkpoint được lưu:
 
 ```text
-models_generalized/best.pth    # validation mAP tốt nhất
-models_generalized/latest.pth  # Checkpoint mới nhất
-models_generalized/epoch_*.pth # top-k checkpoint để ensemble/model soup
+models_p3p5/best.pth    # validation mAP tốt nhất
+models_p3p5/latest.pth  # Checkpoint mới nhất
+models_p3p5/epoch_*.pth # top-k checkpoint để ensemble/model soup
 ```
 
 Mặc định backbone dùng trọng số ImageNet. Để khởi tạo toàn bộ mô hình ngẫu nhiên:
@@ -171,6 +184,23 @@ Mặc định backbone dùng trọng số ImageNet. Để khởi tạo toàn b�
 ```bash
 python train.py ... --no_pretrained
 ```
+
+Để thử ConvNeXt-Small:
+
+```bash
+python train.py \
+  --train_data ./public/annotations/train.json \
+  --val_data ./public/annotations/val.json \
+  --image_dir ./public/train/images \
+  --val_image_dir ./public/val/images \
+  --checkpoint_dir ./models_p3p5_small/ \
+  --epochs 60 \
+  --batch_size 8 \
+  --lr 7e-4 \
+  --backbone small
+```
+
+ConvNeXt-Small tốn nhiều VRAM hơn. Nên thử Tiny trước để xác định lợi ích của head đa tỉ lệ, sau đó mới so sánh Small.
 
 Để tiếp tục train từ checkpoint:
 

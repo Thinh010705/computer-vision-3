@@ -12,16 +12,16 @@ from utils.loss import DetectionLoss
 from utils.nms import decode_predictions, non_maximum_suppression, bbox_iou
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train custom ResNet-50 FPN Object Detector.")
+    parser = argparse.ArgumentParser(description="Train custom ConvNeXt FPN anchor-free detector.")
     parser.add_argument("--train_data", required=True, type=str, help="Path to train.json")
     parser.add_argument("--val_data", required=True, type=str, help="Path to val.json")
     parser.add_argument("--image_dir", required=True, type=str, help="Path to train images")
     parser.add_argument("--val_image_dir", required=True, type=str, help="Path to val images")
     parser.add_argument("--checkpoint_dir", required=True, type=str, help="Directory to save checkpoints")
     
-    # Training Hyperparameters
+    # Tham sô huấn luyện và đánh giá
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
     parser.add_argument("--multi_scale", action="store_true", default=True, help="Enable multi-scale training")
@@ -31,6 +31,7 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=2, help="DataLoader workers")
     parser.add_argument("--resume", type=str, default=None, help="Optional checkpoint for fine-tuning/resume")
     parser.add_argument("--no_pretrained", action="store_true", help="Initialize ConvNeXt backbone without ImageNet weights")
+    parser.add_argument("--backbone", choices=["tiny", "small"], default="tiny", help="ConvNeXt backbone size")
     parser.add_argument("--mosaic_prob", type=float, default=0.15, help="Mosaic probability during the strong augmentation phase")
     parser.add_argument("--close_mosaic_epochs", type=int, default=15, help="Disable mosaic and strong augmentation for final epochs")
     parser.add_argument("--fine_tune_lr_scale", type=float, default=0.25, help="Multiply LR when entering final fine-tune phase")
@@ -46,6 +47,7 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 def compute_ap(recalls, precisions):
+    # Tính Average Precision (AP) bằng cách tính diện tích dưới đường cong Precision-Recall.
     if not recalls:
         return 0.0
     mrec = [0.0] + recalls + [1.0]
@@ -64,43 +66,47 @@ def collate_fn(batch):
     Prevents PyTorch default_collate from trying to stack variable-size tensors (bboxes/labels) in metadata.
     """
     images = [item[0] for item in batch]
-    targets = [item[1] for item in batch]
+    target_lists = [item[1] for item in batch]
     metas = [item[2] for item in batch]
-    return torch.stack(images, 0), torch.stack(targets, 0), metas
+    targets = [
+        torch.stack([sample_targets[scale_idx] for sample_targets in target_lists], 0)
+        for scale_idx in range(len(target_lists[0]))
+    ]
+    return torch.stack(images, 0), targets, metas
 
 
 def evaluate_map(model, val_loader, device, conf_threshold=0.05, iou_threshold=0.5):
     """
-    Computes exact mAP@0.5 on the validation set using the grading logic.
+        Tính mAP@0.5 trên tập validation bằng cách so sánh dự đoán của mô hình với Ground Truth.
     """
     model.eval()
     
-    # Store all ground truths and predictions
+    # Lưu Ground Truth và dự đoán theo lớp để tính toán mAP.
     classes = ["person", "car", "dog", "cat", "chair"]
     
     gt_boxes_by_class = {cls: {} for cls in classes}
     pred_boxes_by_class = {cls: [] for cls in classes}
     
-    # Total ground truth boxes counter
+    # Đếm số lượng Ground Truth cho mỗi lớp để tính recall.
     gt_counts = {cls: 0 for cls in classes}
     
     with torch.no_grad():
         for images, _, metas in val_loader:
             images = images.to(device)
-            outputs = model(images)  # (batch, 10, S, S)
+            outputs = model(images)
             
             for b in range(images.shape[0]):
                 img_id = metas[b]['image_id']
                 w_orig = metas[b]['width_orig']
                 h_orig = metas[b]['height_orig']
                 
-                # Extract ground truth boxes for this image
+                # Lấy Ground Truth gốc (trước khi resize) để tính mAP.
                 bboxes_gt = metas[b]['bboxes_orig']  # tensor
                 labels_gt = metas[b]['labels_orig']
                 
-                # Group GTs by class
+                # Lưu Ground Truth theo lớp.
                 for bbox, label in zip(bboxes_gt, labels_gt):
-                    # Filter padded bboxes if any (width/height = 0)
+                    # Bỏ qua các bounding box không hợp lệ
                     if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
                         continue
                     cls_name = classes[label.item()]
@@ -112,9 +118,9 @@ def evaluate_map(model, val_loader, device, conf_threshold=0.05, iou_threshold=0
                     })
                     gt_counts[cls_name] += 1
                 
-                # Decode model predictions
-                # Outputs[b] has shape (10, S, S)
-                raw_predictions = decode_predictions(outputs[b], w_orig, h_orig, conf_threshold=conf_threshold)
+                # Decode all P3/P4/P5 predictions for this image.
+                image_outputs = [scale_output[b] for scale_output in outputs]
+                raw_predictions = decode_predictions(image_outputs, w_orig, h_orig, conf_threshold=conf_threshold)
                 # Apply class-wise NMS
                 final_predictions = non_maximum_suppression(raw_predictions, iou_threshold=iou_threshold)
                 
@@ -195,7 +201,7 @@ def train(args):
     print(f"Using device: {device}")
     
     # 3. Create Datasets
-    # Default resolution is 448 (yielding 14x14 grid size)
+    # Default resolution is 448, yielding P3/P4/P5 grids 56x56, 28x28, 14x14.
     train_dataset = DetectionDataset(args.train_data, args.image_dir, resolution=448, is_train=True)
     val_dataset = DetectionDataset(args.val_data, args.val_image_dir, resolution=448, is_train=False)
     train_dataset.base_mosaic_prob = args.mosaic_prob
@@ -223,8 +229,19 @@ def train(args):
         collate_fn=collate_fn
     )
     
+    resume_checkpoint = None
+    if args.resume:
+        print(f"Resuming/fine-tuning from: {args.resume}")
+        try:
+            resume_checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+        except TypeError:
+            resume_checkpoint = torch.load(args.resume, map_location=device)
+        if isinstance(resume_checkpoint, dict):
+            resume_config = resume_checkpoint.get("model_config", {})
+            args.backbone = resume_config.get("backbone", args.backbone)
+
     # 4. Instantiate Model, Loss, Optimizer, and Cosine Scheduler
-    model = ResNetYOLO(pretrained=not args.no_pretrained).to(device)
+    model = ResNetYOLO(pretrained=not args.no_pretrained, backbone_name=args.backbone).to(device)
     
     # Inverse-frequency class weights used by the proven baseline.
     # Frequency counts: person: 5829, car: 1339, dog: 1028, cat: 833, chair: 1613
@@ -251,20 +268,15 @@ def train(args):
 
     start_epoch = 0
     resume_best_map = 0.0
-    if args.resume:
-        print(f"Resuming/fine-tuning from: {args.resume}")
-        try:
-            checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
-        except TypeError:
-            checkpoint = torch.load(args.resume, map_location=device)
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            model.load_state_dict(checkpoint["model_state_dict"])
-            if "optimizer_state_dict" in checkpoint:
-                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            start_epoch = int(checkpoint.get("epoch", -1)) + 1
-            resume_best_map = float(checkpoint.get("mAP", 0.0))
+    if resume_checkpoint is not None:
+        if isinstance(resume_checkpoint, dict) and "model_state_dict" in resume_checkpoint:
+            model.load_state_dict(resume_checkpoint["model_state_dict"])
+            if "optimizer_state_dict" in resume_checkpoint:
+                optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+            start_epoch = int(resume_checkpoint.get("epoch", -1)) + 1
+            resume_best_map = float(resume_checkpoint.get("mAP", 0.0))
         else:
-            model.load_state_dict(checkpoint)
+            model.load_state_dict(resume_checkpoint)
 
     # Cosine learning rate decay for smooth convergence
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -280,6 +292,11 @@ def train(args):
     fine_start_epoch = max(0, args.epochs - args.close_mosaic_epochs)
     fine_lr_applied = False
     top_checkpoints = []
+    model_config = {
+        "backbone": args.backbone,
+        "model_version": getattr(model, "model_version", "unknown"),
+        "strides": list(getattr(model, "strides", (8, 16, 32))),
+    }
     
     for epoch in range(start_epoch, args.epochs):
         model.train()
@@ -308,7 +325,7 @@ def train(args):
         
         for batch_idx, (images, targets, _) in enumerate(progress_bar):
             images = images.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
+            targets = [target.to(device, non_blocking=True) for target in targets]
             
             # Linear Learning Rate Warm-up during first 3 epochs to protect pre-trained weights
             warmup_epochs = 3
@@ -367,6 +384,7 @@ def train(args):
                 'mAP': val_map,
                 'conf_threshold': args.conf_threshold,
                 'iou_threshold': args.iou_threshold,
+                'model_config': model_config,
             }, best_path)
             print(f"⭐ New Best Model saved with mAP@0.5 = {val_map:.4f} at {best_path}")
 
@@ -376,6 +394,7 @@ def train(args):
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'mAP': val_map,
+            'model_config': model_config,
         }, top_path)
         top_checkpoints.append((val_map, top_path))
         top_checkpoints.sort(key=lambda item: item[0], reverse=True)
@@ -393,6 +412,7 @@ def train(args):
             'mAP': val_map,
             'conf_threshold': args.conf_threshold,
             'iou_threshold': args.iou_threshold,
+            'model_config': model_config,
         }, latest_path)
 
     print(f"\nTraining completed! Best Validation mAP@0.5 = {best_map:.4f}")

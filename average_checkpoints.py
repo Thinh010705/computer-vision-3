@@ -51,6 +51,8 @@ def main():
         "source_checkpoints": args.checkpoints,
         "source_maps": maps,
     }
+    if isinstance(checkpoints[0], dict) and "model_config" in checkpoints[0]:
+        output["model_config"] = checkpoints[0]["model_config"]
     torch.save(output, args.output)
     print(f"Saved averaged checkpoint from {len(states)} models to {args.output}")
 

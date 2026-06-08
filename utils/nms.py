@@ -33,6 +33,12 @@ def decode_predictions(prediction, img_width, img_height, conf_threshold=0.15):
     img_width, img_height: original image size
     conf_threshold: confidence threshold for filtering
     """
+    if isinstance(prediction, (list, tuple)):
+        decoded = []
+        for scale_prediction in prediction:
+            decoded.extend(decode_predictions(scale_prediction, img_width, img_height, conf_threshold))
+        return decoded
+
     S = prediction.shape[1]
     classes = ["person", "car", "dog", "cat", "chair"]
     
