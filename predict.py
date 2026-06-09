@@ -7,7 +7,7 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 from tqdm import tqdm
 
-from models.detector import ResNetYOLO
+from models.detector import ConvNeXtFPNDetector
 from utils.nms import decode_predictions, non_maximum_suppression
 
 def parse_args():
@@ -42,7 +42,7 @@ def load_models(checkpoint_paths, device):
     models = []
     for checkpoint_path in checkpoint_paths:
         state_dict, model_config = load_checkpoint_state(checkpoint_path, device)
-        model = ResNetYOLO(pretrained=False, backbone_name=model_config.get("backbone", "tiny"))
+        model = ConvNeXtFPNDetector(pretrained=False, backbone_name=model_config.get("backbone", "tiny"))
         model.load_state_dict(state_dict)
         model = model.to(device)
         model.eval()
@@ -89,10 +89,11 @@ def predict_image_boxes(models, img, conf_threshold, tta_flip, tta_sizes, normal
         img_tensor = prepare_image(img, size, normalize, device)
         for model in models:
             output = model(img_tensor)
+            flipped_output = model(torch.flip(img_tensor, dims=[3])) if tta_flip else None
+
             image_outputs = [scale_output[0] for scale_output in output]
             raw_boxes.extend(decode_predictions(image_outputs, w_orig, h_orig, conf_threshold=conf_threshold))
-            if tta_flip:
-                flipped_output = model(torch.flip(img_tensor, dims=[3]))
+            if flipped_output is not None:
                 flipped_image_outputs = [scale_output[0] for scale_output in flipped_output]
                 flipped_boxes = decode_predictions(flipped_image_outputs, w_orig, h_orig, conf_threshold=conf_threshold)
                 raw_boxes.extend(flip_boxes_back(flipped_boxes, w_orig))

@@ -1,147 +1,48 @@
-# Phát hiện đối tượng Anchor-Free đa tỉ lệ với ConvNeXt và FPN tự cài đặt
+# Mô hình Phát hiện Đối tượng Anchor-Free Đa Tỉ lệ với Backbone ConvNeXt & FPN P3/P4/P5
 
-Dự án xây dựng một detector anchor-free cho 5 lớp:
-
-```text
-person, car, dog, cat, chair
-```
-
-Phần phát hiện đối tượng được cài đặt trực tiếp bằng PyTorch: tạo target lưới, detection heads, hàm mất mát, giải mã hộp bao, confidence filtering và class-wise NMS. Dự án không sử dụng detector hoàn chỉnh như YOLOv5/v8, Detectron2, MMDetection, Faster R-CNN hoặc SSD có sẵn.
-
-Backbone `ConvNeXt-Tiny` hoặc `ConvNeXt-Small` pretrained ImageNet được sử dụng làm mạng trích xuất đặc trưng. Điều này phù hợp với quy định cho phép dùng backbone đã huấn luyện trước; toàn bộ detection pipeline phía sau backbone vẫn được tự cài đặt.
-
-> `ResNetYOLO` là tên lớp giữ lại từ phiên bản đầu. Kiến trúc thực tế trong `models/detector.py` sử dụng ConvNeXt, không phải ResNet-50.
-
-## Nâng cấp kiến trúc hiện tại
-
-Phiên bản mới giải quyết hai giới hạn lớn của detector stride-16 cũ:
-
-- Thêm ba detection head anchor-free tại stride `8/16/32`.
-- Mỗi ground-truth box được gán vào scale chính và một scale lân cận, tạo nhiều positive supervision và giảm xung đột cùng cell.
-- Head stride 8 ưu tiên vật thể nhỏ như `chair` và `car` ở xa.
-- Head stride 32 cung cấp receptive field phù hợp vật thể lớn.
-- Hỗ trợ chọn `--backbone tiny` hoặc `--backbone small`.
-- Checkpoint lưu `model_config`; `predict.py` tự dựng đúng backbone khi load.
-- Fallback augmentation giữ lại box thay vì biến ảnh có vật thể thành background.
-
-Kiến trúc mới không tương thích trực tiếp với checkpoint stride-16 cũ. Hãy giữ checkpoint baseline để đối chứng và train bản mới vào thư mục riêng, ví dụ `./models_p3p5/`.
-
-## Kết quả baseline đã đo
-
-Kết quả của phiên bản stride-16 trước khi nâng cấp, đo trên validation bằng công cụ chấm chính thức:
+Kiến trúc sử dụng backbone **ConvNeXt-Tiny** hoặc **ConvNeXt-Small** pretrained ImageNet kết hợp FPN và các detection head tự cài đặt. Mô hình kết hợp ConvNeXt với **FPN (Feature Pyramid Network) đa tỉ lệ P3/P4/P5**, tạo ba lưới dự đoán tại stride `8`, `16` và `32`. Với ảnh đầu vào `448 x 448`, các lưới tương ứng có kích thước:
 
 ```text
-mAP@0.5:         0.778076
-Performance:     20/20
-Micro recall:    0.914399
-Micro precision: 0.110269
+P3: 56 x 56 - ưu tiên vật thể nhỏ
+P4: 28 x 28 - ưu tiên vật thể trung bình
+P5: 14 x 14 - ưu tiên vật thể lớn
 ```
 
-Kết quả trên là mốc đối chứng cần vượt qua. Kiến trúc P3/P4/P5 mới cần được train lại và đánh giá bằng cùng evaluator, threshold tuning và TTA để xác định mức cải thiện thực tế.
+Toàn bộ pipeline phát hiện đối tượng phía sau backbone được tự cài đặt bằng PyTorch, bao gồm FPN, decoupled detection heads, target assignment đa tỉ lệ, hàm mất mát, giải mã hộp bao, confidence filtering và class-wise NMS.
 
-## Cấu trúc dự án
+---
+
+## 📂 Cấu trúc Thư mục Nộp bài
 
 ```text
-<submission>/
-├── public/
-├── models/
-│   ├── detector.py          # ConvNeXt, FPN P3/P4/P5 và decoupled heads
-│   └── best.pth             # Checkpoint tốt nhất theo validation mAP@0.5
-├── utils/
-│   ├── dataset.py           # Đọc JSON, augment, mosaic và sinh target lưới
-│   ├── loss.py              # Focal objectness, weighted CE, CIoU và Smooth L1
-│   └── nms.py               # Decode bbox, IoU và class-wise NMS tự cài đặt
-├── train.py                 # Train, AMP, staged augmentation, top-k checkpoint và validation mAP
-├── predict.py               # Suy luận, flip/multi-scale TTA, ensemble và predictions.json
-├── tune_thresholds.py       # Tìm confidence/NMS threshold tốt nhất trên validation
-├── average_checkpoints.py   # Tạo model soup bằng trung bình trọng số
-├── EXPERIMENT_VARIANT.md
-├── README.md
-└── requirements.txt
+<my_submission>/
+├── models/                       # Định nghĩa mô hình và lưu checkpoint sau khi train
+│   └── detector.py               # ConvNeXtFPNDetector: backbone, FPN P3/P4/P5 và heads
+├── utils/                        # Các thành phần dùng chung cho dữ liệu, loss và hậu xử lý
+│   ├── dataset.py                # Đọc JSON/ảnh, augmentation, Mosaic và tạo target đa tỉ lệ
+│   ├── loss.py                   # Focal Loss, Weighted CE, CIoU và Smooth L1 tự cài đặt
+│   └── nms.py                    # Decode hộp bao, tính IoU và Class-wise NMS tự cài đặt
+├── train.py                      # Huấn luyện, validation mAP, AMP và lưu top-k checkpoint
+├── predict.py                    # Suy luận ảnh, TTA/ensemble và xuất predictions.json
+├── tune_thresholds.py            # Quét confidence/NMS threshold tốt nhất trên validation
+├── average_checkpoints.py        # Tạo model soup bằng trung bình trọng số checkpoint
+├── README.md                     # Hướng dẫn cài đặt, huấn luyện, suy luận và đánh giá
+└── requirements.txt              # Danh sách thư viện Python cần cài đặt
 ```
 
-## Kiến trúc mô hình
+---
 
-### Backbone và FPN đa tỉ lệ
+## 🚀 Hướng dẫn Thiết lập và chạy chương trình
 
-Ảnh được chuẩn hóa theo ImageNet và đưa qua `ConvNeXt-Tiny`:
-
-```text
-Ảnh đầu vào
-    ↓
-ConvNeXt-Tiny/Small pretrained ImageNet
-    ├── feature stride 8,  192 channels
-    ├── feature stride 16, 384 channels
-    └── feature stride 32, 768 channels
-              ↓
-       FPN top-down fusion
-              ↓
-       heads stride 8 / 16 / 32
-```
-
-Với ảnh `448×448`, ba lưới đầu ra có kích thước `56×56`, `28×28` và `14×14`.
-
-### Detection heads
-
-Mô hình sử dụng hai nhánh dự đoán tách biệt:
-
-- Classification head: `objectness + 5 class logits`.
-- Regression head: `x, y, width, height`.
-
-Mỗi cell trên mỗi scale dự đoán tối đa một đối tượng. Đầu ra mỗi scale có dạng:
-
-```text
-[objectness, class_1 ... class_5, x, y, w, h]
-```
-
-### Hàm mất mát
-
-Loss được tự cài đặt và gồm:
-
-- Focal Loss cho objectness.
-- Weighted Cross Entropy với class weights cho phân lớp.
-- CIoU Loss và Smooth L1 cho hồi quy hộp bao.
-
-Class weights sử dụng inverse-frequency như cấu hình baseline đạt mAP tốt nhất.
-
-## Quy trình dữ liệu
-
-Dataset đọc trực tiếp `train.json` và `val.json`, hỗ trợ nhiều đối tượng trong một ảnh và tạo target cho ba lưới stride `8/16/32`. Mỗi đối tượng được gán vào hai scale phù hợp để tăng positive supervision và giảm mất nhãn do nhiều tâm rơi vào cùng cell.
-
-Huấn luyện sử dụng staged augmentation:
-
-### Giai đoạn đầu
-
-- Horizontal flip.
-- Mosaic 4 ảnh với xác suất mặc định `0.15`.
-- Random resized crop nhẹ.
-- Affine nhẹ.
-- Brightness, contrast, hue và saturation.
-- Noise và cutout nhẹ.
-- Multi-scale training ở `416`, `448`, `480`.
-
-### Giai đoạn cuối
-
-Trong 15 epoch cuối:
-
-- Tắt mosaic.
-- Cố định kích thước `448×448`.
-- Chỉ giữ augmentation nhẹ.
-- Giảm learning rate để fine-tune trên phân phối gần ảnh thật.
-
-Resolution `384×384` đã được loại bỏ vì các thí nghiệm cho thấy nó làm giảm validation mAP đáng kể.
-
-## Cài đặt môi trường
+### Bước 1: Cài đặt Môi trường
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Khuyến nghị sử dụng GPU NVIDIA hỗ trợ CUDA. Code vẫn có thể chạy trên CPU nhưng quá trình huấn luyện sẽ chậm.
+### Bước 2: Huấn luyện Mô hình
 
-## Huấn luyện
 
-### Lệnh bắt buộc
 
 ```bash
 python train.py \
@@ -152,7 +53,17 @@ python train.py \
   --checkpoint_dir ./models/
 ```
 
-### Cấu hình khuyến nghị
+Mặc định chương trình:
+
+- Dùng backbone `ConvNeXt-Tiny` pretrained ImageNet.
+- Huấn luyện `50` epoch.
+- Dùng batch size `16`.
+- Bật multi-scale training.
+- Lưu mô hình tốt nhất vào `./models/best.pth`.
+- Lưu trạng thái gần nhất vào `./models/latest.pth`.
+- Giữ lại các top-k checkpoint theo validation mAP.
+
+#### Cấu hình khuyến nghị với ConvNeXt-Tiny
 
 ```bash
 python train.py \
@@ -160,7 +71,7 @@ python train.py \
   --val_data ./public/annotations/val.json \
   --image_dir ./public/train/images \
   --val_image_dir ./public/val/images \
-  --checkpoint_dir ./models_p3p5/ \
+  --checkpoint_dir ./models_p3p5_tiny/ \
   --epochs 60 \
   --batch_size 16 \
   --lr 1e-3 \
@@ -171,21 +82,7 @@ python train.py \
   --save_top_k 5
 ```
 
-Checkpoint được lưu:
-
-```text
-models_p3p5/best.pth    # validation mAP tốt nhất
-models_p3p5/latest.pth  # Checkpoint mới nhất
-models_p3p5/epoch_*.pth # top-k checkpoint để ensemble/model soup
-```
-
-Mặc định backbone dùng trọng số ImageNet. Để khởi tạo toàn bộ mô hình ngẫu nhiên:
-
-```bash
-python train.py ... --no_pretrained
-```
-
-Để thử ConvNeXt-Small:
+#### Cấu hình thử nghiệm với ConvNeXt-Small
 
 ```bash
 python train.py \
@@ -197,63 +94,57 @@ python train.py \
   --epochs 60 \
   --batch_size 8 \
   --lr 7e-4 \
-  --backbone small
+  --backbone small \
+  --mosaic_prob 0.15 \
+  --close_mosaic_epochs 15 \
+  --fine_tune_lr_scale 0.25 \
+  --save_top_k 5
 ```
 
-ConvNeXt-Small tốn nhiều VRAM hơn. Nên thử Tiny trước để xác định lợi ích của head đa tỉ lệ, sau đó mới so sánh Small.
+ConvNeXt-Small có khả năng biểu diễn mạnh hơn nhưng tốn nhiều VRAM và có nguy cơ overfit cao hơn. Nên huấn luyện ConvNeXt-Tiny trước để đo lợi ích của kiến trúc đa tỉ lệ, sau đó mới so sánh với Small bằng cùng evaluator.
 
-Để tiếp tục train từ checkpoint:
+#### Huấn luyện không dùng pretrained ImageNet
 
 ```bash
-python train.py ... --resume ./models/best.pth
+python train.py ... --no_pretrained
 ```
 
-## Tune confidence và NMS
+### Bước 3: Tune Confidence và NMS Threshold
 
-`tune_thresholds.py` thử nhiều cặp confidence/NMS threshold trên validation. Script không thay đổi trọng số mô hình.
-
-Tune không dùng TTA:
-
-```bash
-python tune_thresholds.py \
-  --val_data ./public/annotations/val.json \
-  --val_image_dir ./public/val/images \
-  --checkpoint ./models/best.pth
-```
-
-Tune với TTA lật ngang:
+Sau khi train xong, chạy `tune_thresholds.py` trên validation để tìm confidence threshold và NMS IoU threshold tốt nhất:
 
 ```bash
 python tune_thresholds.py \
   --val_data ./public/annotations/val.json \
   --val_image_dir ./public/val/images \
-  --checkpoint ./models/best.pth \
+  --checkpoint ./models_p3p5_tiny/best.pth \
   --tta_flip
 ```
 
-Tune với multi-scale TTA:
+Script sẽ in dòng kết quả cuối dạng:
+
+```text
+BEST conf=0.03 iou=0.45 mAP@0.5=...
+```
+
+Sử dụng đúng hai giá trị `conf` và `iou` này khi chạy `predict.py`. Nếu tune có `--tta_flip`, suy luận cuối cũng phải bật `--tta_flip`.
+
+Có thể thử multi-scale TTA:
 
 ```bash
 python tune_thresholds.py \
   --val_data ./public/annotations/val.json \
   --val_image_dir ./public/val/images \
-  --checkpoint ./models/best.pth \
+  --checkpoint ./models_p3p5_tiny/best.pth \
   --tta_sizes 416,448,480 \
   --tta_flip
 ```
 
-Trong thí nghiệm hiện tại:
+Multi-scale TTA chậm hơn đáng kể và chỉ nên sử dụng nếu evaluator chính thức cho kết quả cao hơn.
 
-```text
-Không TTA flip: mAP@0.5 = 0.7713
-Có TTA flip:    mAP@0.5 = 0.7781
-```
+### Bước 4: Chạy Suy luận
 
-Vì vậy TTA flip được khuyến nghị cho checkpoint hiện tại. Khi predict hidden test, phải sử dụng cùng TTA và threshold đã tune.
-
-## Suy luận
-
-### Lệnh bắt buộc
+Lệnh suy luận bắt buộc theo đề bài:
 
 ```bash
 python predict.py \
@@ -261,75 +152,42 @@ python predict.py \
   --output predictions.json
 ```
 
-### Cấu hình khuyến nghị
-
-Thay `<best_conf>` và `<best_iou>` bằng kết quả từ `tune_thresholds.py`:
-
-```bash
-python predict.py \
-  --image_dir /path/to/images \
-  --output predictions.json \
-  --checkpoint ./models/best.pth \
-  --conf_threshold <best_conf> \
-  --iou_threshold <best_iou> \
-  --tta_flip
-```
-
-`predict.py` hỗ trợ ensemble nhiều checkpoint:
-
-```bash
-python predict.py \
-  --image_dir /path/to/images \
-  --output predictions.json \
-  --checkpoint ./models/model_a.pth ./models/model_b.pth \
-  --tta_flip
-```
-
-Prediction của ảnh gốc, ảnh lật và các checkpoint được gộp trước khi chạy class-wise NMS.
-
-Multi-scale TTA chạy cùng model ở nhiều kích thước:
-
-```bash
-python predict.py \
-  --image_dir /path/to/images \
-  --output predictions_multiscale.json \
-  --checkpoint ./models/best.pth \
-  --tta_sizes 416,448,480 \
-  --tta_flip
-```
-
-Multi-scale TTA chậm hơn đáng kể, vì vậy chỉ sử dụng nếu evaluator chính thức cho kết quả cao hơn.
-
-## Model soup
-
-`train.py` giữ lại top-k checkpoint tốt nhất. Có thể trung bình trọng số của các checkpoint có mAP gần nhau:
-
-```bash
-python average_checkpoints.py \
-  --checkpoints \
-    ./models/epoch_039_map_0.75xx.pth \
-    ./models/epoch_043_map_0.76xx.pth \
-    ./models/epoch_047_map_0.75xx.pth \
-  --output ./models/model_soup.pth
-```
-
-Sau đó tune và đánh giá `model_soup.pth` như checkpoint bình thường. Không nên trộn checkpoint có mAP quá thấp hoặc đến từ kiến trúc khác.
-
-## Đánh giá bằng công cụ chính thức
-
-Tạo prediction trên validation:
+Suy luận trên validation với threshold đã tune:
 
 ```bash
 python predict.py \
   --image_dir ./public/val/images \
   --output predictions.json \
-  --checkpoint ./models/best.pth \
-  --conf_threshold <best_conf> \
-  --iou_threshold <best_iou> \
+  --checkpoint ./models_p3p5_tiny/best.pth \
+  --conf_threshold <BEST_CONF> \
+  --iou_threshold <BEST_IOU> \
   --tta_flip
 ```
 
-Chấm bằng evaluator:
+Suy luận với ConvNeXt-Small sử dụng cùng lệnh, chỉ thay checkpoint:
+
+```bash
+python predict.py \
+  --image_dir ./public/val/images \
+  --output predictions_small.json \
+  --checkpoint ./models_p3p5_small/best.pth \
+  --conf_threshold <BEST_CONF_SMALL> \
+  --iou_threshold <BEST_IOU_SMALL> \
+  --tta_flip
+```
+
+Mỗi ảnh luôn xuất hiện trong file kết quả. Nếu không phát hiện đối tượng, chương trình xuất:
+
+```json
+{
+  "image_id": "image.jpg",
+  "boxes": []
+}
+```
+
+### Bước 5: Tự chấm điểm và Đánh giá mAP@0.5
+
+Sau khi tạo `predictions.json`, chạy evaluator chính thức:
 
 ```bash
 python public/tools/evaluate_predictions.py \
@@ -338,9 +196,146 @@ python public/tools/evaluate_predictions.py \
   --output score.json
 ```
 
-Điểm trong `score.json` là kết quả gần nhất với cách hệ thống chấm hidden test. mAP hiển thị trong `train.py` chủ yếu dùng để chọn checkpoint tốt nhất.
+Xem kết quả:
 
-## Định dạng predictions.json
+```bash
+cat score.json
+```
+
+Điểm trong `score.json` là kết quả cần dùng để so sánh mô hình. Validation mAP hiển thị trong `train.py` chủ yếu dùng để lựa chọn checkpoint.
+
+---
+
+## 🛠️ Điểm nhấn Công nghệ của Giải pháp
+
+### 1. Backbone ConvNeXt-Tiny hoặc ConvNeXt-Small
+
+- Mặc định sử dụng **ConvNeXt-Tiny pretrained ImageNet** để đạt cân bằng tốt giữa độ chính xác, tốc độ và bộ nhớ GPU.
+- Hỗ trợ **ConvNeXt-Small** nhằm thử nghiệm backbone có khả năng biểu diễn mạnh hơn.
+- Backbone được fine-tune với learning rate nhỏ hơn detection head để bảo vệ đặc trưng pretrained.
+- Toàn bộ FPN, detection heads, target assignment, loss và hậu xử lý được tự cài đặt.
+
+### 2. FPN Đa tỉ lệ P3/P4/P5
+
+Mô hình lấy ba feature map từ ConvNeXt:
+
+```text
+C2: stride 8,  192 channels
+C3: stride 16, 384 channels
+C4: stride 32, 768 channels
+```
+
+Các feature được chiếu về `256` kênh và dung hợp theo hướng top-down:
+
+```text
+P5 = projection(C4)
+P4 = fusion(projection(C3), upsample(P5))
+P3 = fusion(projection(C2), upsample(P4))
+```
+
+Ba head dự đoán độc lập:
+
+- `P3`, stride 8: tăng khả năng phát hiện vật thể nhỏ.
+- `P4`, stride 16: xử lý vật thể trung bình.
+- `P5`, stride 32: cung cấp receptive field lớn cho vật thể lớn.
+
+### 3. Anchor-Free Target Assignment Đa tỉ lệ
+
+Mô hình không sử dụng anchor box. Mỗi object được mã hóa thành:
+
+```text
+[objectness, 5 class targets, center_x, center_y, width, height]
+```
+
+Mỗi ground-truth box được gán vào:
+
+- Một scale chính dựa trên kích thước đối tượng.
+- Một scale lân cận để tạo thêm positive supervision.
+
+Cơ chế này giúp:
+
+- Giảm mất nhãn khi nhiều object có tâm rơi vào cùng cell.
+- Tăng tín hiệu huấn luyện cho vật thể nhỏ.
+- Giữ thiết kế anchor-free và dễ giải thích.
+
+Nếu vẫn xảy ra xung đột cùng một cell trên cùng scale, hệ thống ưu tiên đối tượng nhỏ hơn vì đây thường là đối tượng khó phát hiện hơn.
+
+### 4. Decoupled Detection Heads với Depthwise-Separable Convolution
+
+Mỗi scale sử dụng hai nhánh riêng:
+
+- Classification/Objectness Head: dự đoán objectness và 5 class logits.
+- Regression Head: dự đoán `x, y, width, height`.
+
+Việc tách nhánh giúp giảm xung đột giữa nhiệm vụ phân lớp và định vị. Các head sử dụng **depthwise-separable convolution tự cài đặt** để giảm FLOPs và bộ nhớ, đặc biệt quan trọng với lưới P3 `56 x 56`.
+
+### 5. Hàm mất mát Focal Loss, Weighted CE, CIoU và Smooth L1
+
+Hàm mất mát gồm:
+
+- **Focal Loss** cho objectness, giúp giảm ảnh hưởng của số lượng lớn background cell.
+- **Weighted Cross Entropy** cho phân lớp, xử lý mất cân bằng giữa 5 lớp.
+- **CIoU Loss** cho hộp bao, tối ưu độ chồng lắp, khoảng cách tâm và tỷ lệ khung hình.
+- **Smooth L1 Loss** hỗ trợ ổn định quá trình học tọa độ.
+
+Loss được tính riêng trên từng scale và lấy trung bình giữa P3/P4/P5.
+
+### 6. Staged Augmentation và Multi-Scale Training
+
+Trong giai đoạn đầu, mô hình sử dụng:
+
+- Horizontal Flip.
+- Mosaic bốn ảnh.
+- Random Resized Crop.
+- Affine nhẹ.
+- Brightness, Contrast, Hue và Saturation.
+- Gaussian Noise và CoarseDropout.
+- Multi-scale training tại `416`, `448`, `480`.
+
+Trong `15` epoch cuối:
+
+- Tắt Mosaic.
+- Cố định kích thước `448 x 448`.
+- Chỉ giữ augmentation nhẹ.
+- Giảm learning rate để fine-tune trên phân phối gần ảnh thật.
+
+### 7. Differential Learning Rates, Warm-up, Cosine Decay và AMP
+
+- Backbone ConvNeXt dùng learning rate bằng `0.1` learning rate của FPN và heads.
+- Ba epoch đầu sử dụng linear warm-up.
+- Sau đó learning rate giảm theo Cosine Annealing.
+- Mixed Precision AMP giúp giảm bộ nhớ và tăng tốc huấn luyện.
+- Gradient clipping hạn chế cập nhật bất thường.
+
+### 8. Class-wise NMS, TTA và Ensemble
+
+- Confidence được tính bằng `objectness × class probability`.
+- Dự đoán từ P3/P4/P5 được hợp nhất trước khi chạy NMS.
+- Class-wise NMS tự cài đặt loại bỏ hộp trùng lặp theo từng lớp.
+- Hỗ trợ horizontal-flip TTA và multi-scale TTA.
+- Hỗ trợ ensemble nhiều checkpoint và model soup.
+
+---
+
+## 📊 Kết quả Baseline và Cách So sánh
+
+Kết quả tốt nhất đã ghi nhận của kiến trúc stride-16 trước khi nâng cấp:
+
+```text
+mAP@0.5 = 0.77937
+```
+
+Đây là baseline đối chứng, không phải kết quả đã xác nhận của kiến trúc P3/P4/P5 mới. Sau khi train Tiny hoặc Small, cần dùng cùng quy trình:
+
+```text
+train -> tune threshold -> predict -> official evaluator
+```
+
+Chỉ chọn kiến trúc mới nếu `score.json` tốt hơn baseline hoặc cho kết quả ổn định hơn trên nhiều checkpoint. Đặc biệt nên theo dõi AP của `chair`, `car`, số lượng predictions, micro precision và micro recall.
+
+---
+
+## 📄 Định dạng predictions.json
 
 ```json
 [
@@ -357,16 +352,21 @@ python public/tools/evaluate_predictions.py \
 ]
 ```
 
-- `image_id`: tên file ảnh.
-- `class`: một trong 5 lớp quy định.
-- `confidence`: thuộc `[0, 1]`.
-- `bbox`: `[xmin, ymin, xmax, ymax]` theo tọa độ ảnh gốc.
-- Ảnh không có detection vẫn được xuất với `"boxes": []`.
+Quy định:
 
-## Lưu ý khi so sánh mô hình
+- `image_id` là tên file ảnh trong thư mục suy luận.
+- `class` thuộc một trong 5 lớp quy định.
+- `confidence` nằm trong đoạn `[0, 1]`.
+- `bbox` có dạng `[xmin, ymin, xmax, ymax]` trên tọa độ ảnh gốc.
+- Ảnh không có phát hiện vẫn phải xuất `"boxes": []`.
 
-- Giữ checkpoint đạt `0.778076` làm baseline an toàn.
-- Train các cải tiến mới vào thư mục checkpoint khác.
-- So sánh bằng cùng evaluator, cùng TTA và cùng quy trình tune threshold.
-- Không chọn model chỉ vì một lớp tăng; ưu tiên tổng mAP và độ ổn định qua nhiều epoch.
-- Hidden test có thể khác validation, vì vậy không sử dụng threshold riêng theo lớp hoặc các điều chỉnh quá sát validation.
+---
+
+## ⚠️ Lưu ý Quan trọng
+
+- Giữ checkpoint baseline cũ ở thư mục riêng; không dùng nó để resume kiến trúc P3/P4/P5.
+- ConvNeXt-Tiny nên được thử trước vì ít rủi ro overfit và nhẹ hơn.
+- ConvNeXt-Small nên dùng batch size nhỏ hơn, ví dụ `8`.
+- Nếu tune threshold với `--tta_flip` hoặc `--tta_sizes`, khi predict cũng phải dùng đúng cấu hình đó.
+- Không tăng confidence threshold chỉ để cải thiện micro precision; cần lựa chọn theo mAP chính thức.
+- File `WORK_DONE_SUMMARY.md` trình bày chi tiết cơ chế và đánh giá kỹ thuật của mô hình.

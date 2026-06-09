@@ -10,7 +10,7 @@ Mục tiêu của project là xây dựng một mô hình phát hiện đối t�
 - Nhãn lớp của đối tượng.
 - Độ tin cậy objectness cho từng ô lưới.
 
-Mô hình được thiết kế theo hướng nhẹ hơn các detector hai giai đoạn, nhưng vẫn đủ mạnh nhờ backbone ResNet-50, FPN và chiến lược huấn luyện có tăng cường dữ liệu.
+Mô hình được thiết kế theo hướng nhẹ hơn các detector hai giai đoạn, nhưng vẫn đủ mạnh nhờ backbone ConvNeXt, FPN đa tỉ lệ và chiến lược huấn luyện có tăng cường dữ liệu.
 
 ## 2. Luồng dữ liệu đầu vào
 
@@ -94,15 +94,15 @@ Nếu có nhiều object cùng rơi vào một ô lưới, hệ thống chọn o
 
 ## 5. Kiến trúc mô hình
 
-### 5.1. Backbone ConvNeXt-Tiny (thay cho ResNet-50)
+### 5.1. ConvNeXtFPNDetector với Backbone ConvNeXt-Tiny hoặc ConvNeXt-Small
 
-Mô hình đã được cập nhật để sử dụng `ConvNeXt-Tiny` làm backbone, thay vì `ResNet-50`. Những điểm chính:
+Lớp mô hình chính có tên `ConvNeXtFPNDetector`. Mô hình sử dụng `ConvNeXt-Tiny` mặc định và hỗ trợ `ConvNeXt-Small`. Những điểm chính:
 
 - `ConvNeXt-Tiny` có các stage trích xuất đặc trưng với kích thước kênh khác (stage2: 384 channels tại stride 16; stage3: 768 channels tại stride 32).
 - Các lớp projection FPN được điều chỉnh tương ứng (chiếu 384→256 và 768→256) để hợp nhất đặc trưng.
 - Module feature của backbone được đóng gói trong `backbone_features` và được truy xuất trực tiếp trong `forward()` để lấy `c3` (stride16) và `c4` (stride32).
 
-Việc chuyển sang `ConvNeXt-Tiny` giúp cải thiện biểu diễn không gian và có thể mang lại lợi ích hiệu năng/độ chính xác so với ResNet-50 trong nhiều trường hợp.
+ConvNeXt cung cấp đặc trưng mạnh và phù hợp để kết hợp với FPN đa tỉ lệ cho bài toán detection.
 
 ### 5.2. FPN fusion
 
@@ -233,13 +233,13 @@ Từ toàn bộ pipeline trên, project đã hoàn thiện được một hệ t
 - đọc và chuẩn hóa dữ liệu annotation
 - augmentation dữ liệu khi train
 - mã hóa bbox thành lưới anchor-free
-- mô hình ResNet-50 + FPN + head detection
+- mô hình ConvNeXt + FPN đa tỉ lệ + detection heads
 - loss kết hợp focal loss, CE loss, CIoU và Smooth L1
 - training có multi-scale, warm-up, AMP và differential LR
 - suy luận với decode prediction và NMS
 - đánh giá bằng mAP@0.5
 
-- mô hình ConvNeXt-Tiny + FPN + head detection (thay cho ResNet-50 trong phiên bản gần đây)
+- mô hình ConvNeXt-Tiny/Small + FPN P3/P4/P5 + decoupled detection heads
 
 Nói ngắn gọn, đây là một quy trình detection end-to-end từ dữ liệu thô đến prediction cuối cùng.
 

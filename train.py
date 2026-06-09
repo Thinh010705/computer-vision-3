@@ -7,7 +7,7 @@ from tqdm import tqdm
 import numpy as np
 
 from utils.dataset import DetectionDataset
-from models.detector import ResNetYOLO
+from models.detector import ConvNeXtFPNDetector
 from utils.loss import DetectionLoss
 from utils.nms import decode_predictions, non_maximum_suppression, bbox_iou
 
@@ -241,7 +241,7 @@ def train(args):
             args.backbone = resume_config.get("backbone", args.backbone)
 
     # 4. Instantiate Model, Loss, Optimizer, and Cosine Scheduler
-    model = ResNetYOLO(pretrained=not args.no_pretrained, backbone_name=args.backbone).to(device)
+    model = ConvNeXtFPNDetector(pretrained=not args.no_pretrained, backbone_name=args.backbone).to(device)
     
     # Inverse-frequency class weights used by the proven baseline.
     # Frequency counts: person: 5829, car: 1339, dog: 1028, cat: 833, chair: 1613
@@ -293,6 +293,7 @@ def train(args):
     fine_lr_applied = False
     top_checkpoints = []
     model_config = {
+        "detector": "ConvNeXtFPNDetector",
         "backbone": args.backbone,
         "model_version": getattr(model, "model_version", "unknown"),
         "strides": list(getattr(model, "strides", (8, 16, 32))),

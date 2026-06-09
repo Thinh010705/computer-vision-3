@@ -44,13 +44,12 @@ class DecoupledHead(nn.Module):
         return torch.cat((self.cls_head(x), self.reg_head(x)), dim=1)
 
 
-class ResNetYOLO(nn.Module):
+class ConvNeXtFPNDetector(nn.Module):
     """
-    Anchor-free multi-scale detector.
+    Anchor-free multi-scale detector using a ConvNeXt backbone and P3/P4/P5 FPN.
 
-    The historical class name is kept for checkpoint/script compatibility.
-    The actual backbone is ConvNeXt-Tiny or ConvNeXt-Small. Both variants expose
-    stride-8/16/32 features with 192/384/768 channels.
+    ConvNeXt-Tiny and ConvNeXt-Small both expose stride-8/16/32 features with
+    192/384/768 channels.
     """
 
     strides = (8, 16, 32)
