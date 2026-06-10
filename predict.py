@@ -8,7 +8,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from models.detector import ConvNeXtFPNDetector
-from utils.nms import decode_predictions, non_maximum_suppression
+from utils.nms import decode_predictions, postprocess_detections
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run inference and generate object detection predictions.")
@@ -17,6 +17,7 @@ def parse_args():
     parser.add_argument("--checkpoint", nargs="+", default=["./models/best.pth"], help="One or more checkpoint paths")
     parser.add_argument("--conf_threshold", type=float, default=0.05, help="Confidence threshold")
     parser.add_argument("--iou_threshold", type=float, default=0.50, help="IoU threshold for NMS")
+    parser.add_argument("--fusion", choices=["nms", "wbf"], default="nms", help="Class-wise box post-processing method")
     parser.add_argument("--tta_flip", action="store_true", help="Run horizontal flip test-time augmentation")
     parser.add_argument("--tta_sizes", default="448", help="Comma-separated inference sizes, e.g. 416,448,480")
     parser.add_argument("--max_detections", type=int, default=100, help="Maximum detections per image")
@@ -42,7 +43,11 @@ def load_models(checkpoint_paths, device):
     models = []
     for checkpoint_path in checkpoint_paths:
         state_dict, model_config = load_checkpoint_state(checkpoint_path, device)
-        model = ConvNeXtFPNDetector(pretrained=False, backbone_name=model_config.get("backbone", "tiny"))
+        model = ConvNeXtFPNDetector(
+            pretrained=False,
+            backbone_name=model_config.get("backbone", "tiny"),
+            neck_name=model_config.get("neck", "fpn"),
+        )
         model.load_state_dict(state_dict)
         model = model.to(device)
         model.eval()
@@ -140,10 +145,11 @@ def main():
                     device,
                 )
                 
-                # Apply class-wise NMS
-                final_boxes = limit_detections(non_maximum_suppression(
+                # Apply class-wise NMS or confidence-weighted box fusion.
+                final_boxes = limit_detections(postprocess_detections(
                     raw_boxes, 
-                    iou_threshold=args.iou_threshold
+                    iou_threshold=args.iou_threshold,
+                    method=args.fusion,
                 ), args.max_detections)
                 
                 # Append result

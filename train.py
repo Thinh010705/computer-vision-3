@@ -1,5 +1,7 @@
 import os
 import argparse
+import copy
+import math
 import random
 import torch
 from torch.utils.data import DataLoader
@@ -32,10 +34,12 @@ def parse_args():
     parser.add_argument("--resume", type=str, default=None, help="Optional checkpoint for fine-tuning/resume")
     parser.add_argument("--no_pretrained", action="store_true", help="Initialize ConvNeXt backbone without ImageNet weights")
     parser.add_argument("--backbone", choices=["tiny", "small"], default="tiny", help="ConvNeXt backbone size")
+    parser.add_argument("--neck", choices=["fpn", "pan"], default="fpn", help="Feature fusion neck: top-down FPN or bidirectional PAN-FPN")
     parser.add_argument("--mosaic_prob", type=float, default=0.15, help="Mosaic probability during the strong augmentation phase")
     parser.add_argument("--close_mosaic_epochs", type=int, default=15, help="Disable mosaic and strong augmentation for final epochs")
     parser.add_argument("--fine_tune_lr_scale", type=float, default=0.25, help="Multiply LR when entering final fine-tune phase")
     parser.add_argument("--save_top_k", type=int, default=5, help="Keep top-k checkpoints by validation mAP")
+    parser.add_argument("--ema_decay", type=float, default=0.0, help="EMA decay; set around 0.9998 to enable model EMA")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     return parser.parse_args()
 
@@ -45,6 +49,28 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+class ModelEMA:
+    def __init__(self, model, decay=0.9998):
+        self.ema = copy.deepcopy(model).eval()
+        self.decay = decay
+        self.updates = 0
+        for parameter in self.ema.parameters():
+            parameter.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model):
+        self.updates += 1
+        decay = self.decay * (1.0 - math.exp(-self.updates / 2000.0))
+        model_state = model.state_dict()
+        for key, ema_value in self.ema.state_dict().items():
+            model_value = model_state[key].detach()
+            if ema_value.dtype.is_floating_point:
+                ema_value.mul_(decay).add_(model_value, alpha=1.0 - decay)
+            else:
+                ema_value.copy_(model_value)
+
 
 def compute_ap(recalls, precisions):
     # Tính Average Precision (AP) bằng cách tính diện tích dưới đường cong Precision-Recall.
@@ -239,9 +265,10 @@ def train(args):
         if isinstance(resume_checkpoint, dict):
             resume_config = resume_checkpoint.get("model_config", {})
             args.backbone = resume_config.get("backbone", args.backbone)
+            args.neck = resume_config.get("neck", args.neck)
 
     # 4. Instantiate Model, Loss, Optimizer, and Cosine Scheduler
-    model = ConvNeXtFPNDetector(pretrained=not args.no_pretrained, backbone_name=args.backbone).to(device)
+    model = ConvNeXtFPNDetector(pretrained=not args.no_pretrained, backbone_name=args.backbone, neck_name=args.neck).to(device)
     
     # Inverse-frequency class weights used by the proven baseline.
     # Frequency counts: person: 5829, car: 1339, dog: 1028, cat: 833, chair: 1613
@@ -278,6 +305,11 @@ def train(args):
         else:
             model.load_state_dict(resume_checkpoint)
 
+    ema = ModelEMA(model, args.ema_decay) if args.ema_decay > 0.0 else None
+    if ema is not None and isinstance(resume_checkpoint, dict) and resume_checkpoint.get("ema_state_dict") is not None:
+        ema.ema.load_state_dict(resume_checkpoint["ema_state_dict"])
+        ema.updates = int(resume_checkpoint.get("ema_updates", 0))
+
     # Cosine learning rate decay for smooth convergence
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     
@@ -295,6 +327,7 @@ def train(args):
     model_config = {
         "detector": "ConvNeXtFPNDetector",
         "backbone": args.backbone,
+        "neck": args.neck,
         "model_version": getattr(model, "model_version", "unknown"),
         "strides": list(getattr(model, "strides", (8, 16, 32))),
     }
@@ -361,6 +394,8 @@ def train(args):
             
             scaler.step(optimizer)
             scaler.update()
+            if ema is not None:
+                ema.update(model)
             
             epoch_loss += loss.item()
             progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
@@ -370,7 +405,8 @@ def train(args):
         
         # 6. Evaluation Phase
         print(f"Calculating Validation mAP@0.5...")
-        val_map = evaluate_map(model, val_loader, device, conf_threshold=args.conf_threshold, iou_threshold=args.iou_threshold)
+        eval_model = ema.ema if ema is not None else model
+        val_map = evaluate_map(eval_model, val_loader, device, conf_threshold=args.conf_threshold, iou_threshold=args.iou_threshold)
         
         print(f"Epoch {epoch+1} Summary: Avg Train Loss = {avg_train_loss:.4f} | Val mAP@0.5 = {val_map:.4f}")
         
@@ -380,7 +416,7 @@ def train(args):
             best_path = os.path.join(args.checkpoint_dir, "best.pth")
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': model.state_dict(),
+                'model_state_dict': eval_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'mAP': val_map,
                 'conf_threshold': args.conf_threshold,
@@ -392,7 +428,7 @@ def train(args):
         top_path = os.path.join(args.checkpoint_dir, f"epoch_{epoch + 1:03d}_map_{val_map:.4f}.pth")
         torch.save({
             'epoch': epoch,
-            'model_state_dict': model.state_dict(),
+            'model_state_dict': eval_model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'mAP': val_map,
             'model_config': model_config,
@@ -414,6 +450,8 @@ def train(args):
             'conf_threshold': args.conf_threshold,
             'iou_threshold': args.iou_threshold,
             'model_config': model_config,
+            'ema_state_dict': ema.ema.state_dict() if ema is not None else None,
+            'ema_updates': ema.updates if ema is not None else 0,
         }, latest_path)
 
     print(f"\nTraining completed! Best Validation mAP@0.5 = {best_map:.4f}")

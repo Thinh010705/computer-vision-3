@@ -14,9 +14,9 @@ class ConvBlock(nn.Sequential):
 
 
 class SeparableConvBlock(nn.Sequential):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, stride=1):
         super().__init__(
-            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels, bias=False),
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=stride, padding=1, groups=in_channels, bias=False),
             nn.BatchNorm2d(in_channels),
             nn.SiLU(inplace=True),
             nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
@@ -53,13 +53,16 @@ class ConvNeXtFPNDetector(nn.Module):
     """
 
     strides = (8, 16, 32)
-    model_version = "convnext_fpn_p3p5_v2"
+    model_version = "convnext_fpn_pan_p3p5_v3"
 
-    def __init__(self, pretrained=True, backbone_name="tiny"):
+    def __init__(self, pretrained=True, backbone_name="tiny", neck_name="fpn"):
         super().__init__()
         if backbone_name not in {"tiny", "small"}:
             raise ValueError("backbone_name must be 'tiny' or 'small'")
+        if neck_name not in {"fpn", "pan"}:
+            raise ValueError("neck_name must be 'fpn' or 'pan'")
         self.backbone_name = backbone_name
+        self.neck_name = neck_name
         self.backbone_features = self._build_backbone(backbone_name, pretrained).features
 
         self.proj8 = nn.Conv2d(192, 256, kernel_size=1, bias=False)
@@ -69,6 +72,14 @@ class ConvNeXtFPNDetector(nn.Module):
         self.fuse16 = ConvBlock(512, 256)
         self.fuse8 = ConvBlock(512, 256)
         self.refine32 = ConvBlock(256, 256)
+
+        if neck_name == "pan":
+            # Bottom-up path aggregation sends precise P3 localization features
+            # back to P4/P5 after the normal top-down FPN fusion.
+            self.down8 = SeparableConvBlock(256, 256, stride=2)
+            self.pan16 = SeparableConvBlock(512, 256)
+            self.down16 = SeparableConvBlock(256, 256, stride=2)
+            self.pan32 = SeparableConvBlock(512, 256)
 
         self.head8 = DecoupledHead()
         self.head16 = DecoupledHead()
@@ -105,5 +116,9 @@ class ConvNeXtFPNDetector(nn.Module):
         p32 = self.refine32(self.proj32(c4))
         p16 = self.fuse16(torch.cat((self.proj16(c3), F.interpolate(p32, size=c3.shape[-2:], mode="bilinear", align_corners=False)), dim=1))
         p8 = self.fuse8(torch.cat((self.proj8(c2), F.interpolate(p16, size=c2.shape[-2:], mode="bilinear", align_corners=False)), dim=1))
+
+        if self.neck_name == "pan":
+            p16 = self.pan16(torch.cat((p16, self.down8(p8)), dim=1))
+            p32 = self.pan32(torch.cat((p32, self.down16(p16)), dim=1))
 
         return [self.head8(p8), self.head16(p16), self.head32(p32)]

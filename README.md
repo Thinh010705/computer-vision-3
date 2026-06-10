@@ -1,6 +1,6 @@
-# Mô hình Phát hiện Đối tượng Anchor-Free Đa Tỉ lệ với Backbone ConvNeXt & FPN P3/P4/P5
+# Mô hình Phát hiện Đối tượng Anchor-Free Đa Tỉ lệ với ConvNeXt và FPN/PAN P3/P4/P5
 
-Kiến trúc sử dụng backbone **ConvNeXt-Tiny** hoặc **ConvNeXt-Small** pretrained ImageNet kết hợp FPN và các detection head tự cài đặt. Mô hình kết hợp ConvNeXt với **FPN (Feature Pyramid Network) đa tỉ lệ P3/P4/P5**, tạo ba lưới dự đoán tại stride `8`, `16` và `32`. Với ảnh đầu vào `448 x 448`, các lưới tương ứng có kích thước:
+Kiến trúc sử dụng backbone **ConvNeXt-Tiny** hoặc **ConvNeXt-Small** pretrained ImageNet kết hợp neck FPN/PAN và các detection head tự cài đặt. Mô hình tạo ba lưới dự đoán tại stride `8`, `16` và `32`. Với ảnh đầu vào `448 x 448`, các lưới tương ứng có kích thước:
 
 ```text
 P3: 56 x 56 - ưu tiên vật thể nhỏ
@@ -8,7 +8,7 @@ P4: 28 x 28 - ưu tiên vật thể trung bình
 P5: 14 x 14 - ưu tiên vật thể lớn
 ```
 
-Toàn bộ pipeline phát hiện đối tượng phía sau backbone được tự cài đặt bằng PyTorch, bao gồm FPN, decoupled detection heads, target assignment đa tỉ lệ, hàm mất mát, giải mã hộp bao, confidence filtering và class-wise NMS.
+Toàn bộ pipeline phát hiện đối tượng phía sau backbone được tự cài đặt bằng PyTorch, bao gồm FPN/PAN, decoupled detection heads, target assignment đa tỉ lệ, hàm mất mát, giải mã hộp bao, confidence filtering và class-wise NMS.
 
 ---
 
@@ -17,12 +17,12 @@ Toàn bộ pipeline phát hiện đối tượng phía sau backbone được t�
 ```text
 <my_submission>/
 ├── models/                       # Định nghĩa mô hình và lưu checkpoint sau khi train
-│   └── detector.py               # ConvNeXtFPNDetector: backbone, FPN P3/P4/P5 và heads
+│   └── detector.py               # ConvNeXtFPNDetector: backbone, FPN/PAN P3/P4/P5 và heads
 ├── utils/                        # Các thành phần dùng chung cho dữ liệu, loss và hậu xử lý
 │   ├── dataset.py                # Đọc JSON/ảnh, augmentation, Mosaic và tạo target đa tỉ lệ
 │   ├── loss.py                   # Focal Loss, Weighted CE, CIoU và Smooth L1 tự cài đặt
-│   └── nms.py                    # Decode hộp bao, tính IoU và Class-wise NMS tự cài đặt
-├── train.py                      # Huấn luyện, validation mAP, AMP và lưu top-k checkpoint
+│   └── nms.py                    # Decode, IoU, Class-wise NMS và Weighted Box Fusion tự cài đặt
+├── train.py                      # Huấn luyện, EMA, validation mAP, AMP và lưu top-k checkpoint
 ├── predict.py                    # Suy luận ảnh, TTA/ensemble và xuất predictions.json
 ├── tune_thresholds.py            # Quét confidence/NMS threshold tốt nhất trên validation
 ├── average_checkpoints.py        # Tạo model soup bằng trung bình trọng số checkpoint
@@ -103,6 +103,35 @@ python train.py \
 
 ConvNeXt-Small có khả năng biểu diễn mạnh hơn nhưng tốn nhiều VRAM và có nguy cơ overfit cao hơn. Nên huấn luyện ConvNeXt-Tiny trước để đo lợi ích của kiến trúc đa tỉ lệ, sau đó mới so sánh với Small bằng cùng evaluator.
 
+#### Cấu hình PAN-FPN + EMA để cải thiện tính tổng quát
+
+Giữ nguyên checkpoint ConvNeXt-Small FPN đang có và train biến thể PAN trong một thư mục mới:
+
+```bash
+python train.py \
+  --train_data ./public/annotations/train.json \
+  --val_data ./public/annotations/val.json \
+  --image_dir ./public/train/images \
+  --val_image_dir ./public/val/images \
+  --checkpoint_dir ./models_p3p5_small_pan_ema/ \
+  --epochs 45 \
+  --batch_size 8 \
+  --lr 7e-4 \
+  --weight_decay 2e-4 \
+  --backbone small \
+  --neck pan \
+  --ema_decay 0.9998 \
+  --mosaic_prob 0.15 \
+  --close_mosaic_epochs 5 \
+  --fine_tune_lr_scale 0.25 \
+  --save_top_k 5
+```
+
+- `--neck pan`: thêm đường truyền bottom-up từ P3 về P4/P5 sau FPN top-down.
+- `--ema_decay 0.9998`: đánh giá và lưu trung bình trượt của trọng số để giảm dao động giữa các epoch.
+- Không resume checkpoint FPN vào PAN vì hai kiến trúc có tập tham số khác nhau.
+- `best.pth` và top-k chứa trọng số dùng trực tiếp cho inference; `latest.pth` giữ thêm trạng thái raw/EMA để resume.
+
 #### Huấn luyện không dùng pretrained ImageNet
 
 ```bash
@@ -142,6 +171,27 @@ python tune_thresholds.py \
 
 Multi-scale TTA chậm hơn đáng kể và chỉ nên sử dụng nếu evaluator chính thức cho kết quả cao hơn.
 
+Tune ensemble giữa mô hình FPN hiện tại và mô hình PAN mới:
+
+```bash
+python tune_thresholds.py \
+  --val_data ./public/annotations/val.json \
+  --val_image_dir ./public/val/images \
+  --checkpoint ./models_p3p5_small/best.pth ./models_p3p5_small_pan_ema/best.pth \
+  --tta_flip
+```
+
+Chạy thêm một lần với Weighted Box Fusion rồi chỉ dùng WBF nếu validation mAP tăng:
+
+```bash
+python tune_thresholds.py \
+  --val_data ./public/annotations/val.json \
+  --val_image_dir ./public/val/images \
+  --checkpoint ./models_p3p5_small/best.pth ./models_p3p5_small_pan_ema/best.pth \
+  --fusion wbf \
+  --tta_flip
+```
+
 ### Bước 4: Chạy Suy luận
 
 Lệnh suy luận bắt buộc theo đề bài:
@@ -173,6 +223,19 @@ python predict.py \
   --checkpoint ./models_p3p5_small/best.pth \
   --conf_threshold <BEST_CONF_SMALL> \
   --iou_threshold <BEST_IOU_SMALL> \
+  --tta_flip
+```
+
+Suy luận ensemble FPN + PAN trên tập test:
+
+```bash
+python predict.py \
+  --image_dir /path/to/test/images \
+  --output predictions.json \
+  --checkpoint ./models_p3p5_small/best.pth ./models_p3p5_small_pan_ema/best.pth \
+  --conf_threshold <BEST_ENSEMBLE_CONF> \
+  --iou_threshold <BEST_ENSEMBLE_IOU> \
+  --fusion <nms_or_wbf> \
   --tta_flip
 ```
 
@@ -215,7 +278,7 @@ cat score.json
 - Backbone được fine-tune với learning rate nhỏ hơn detection head để bảo vệ đặc trưng pretrained.
 - Toàn bộ FPN, detection heads, target assignment, loss và hậu xử lý được tự cài đặt.
 
-### 2. FPN Đa tỉ lệ P3/P4/P5
+### 2. FPN/PAN Đa tỉ lệ P3/P4/P5
 
 Mô hình lấy ba feature map từ ConvNeXt:
 
@@ -232,6 +295,19 @@ P5 = projection(C4)
 P4 = fusion(projection(C3), upsample(P5))
 P3 = fusion(projection(C2), upsample(P4))
 ```
+
+Khi bật `--neck pan`, mô hình tiếp tục truyền đặc trưng định vị chi tiết theo hướng bottom-up:
+
+```text
+P4_pan = fusion(P4, downsample(P3))
+P5_pan = fusion(P5, downsample(P4_pan))
+```
+
+FPN giúp đưa ngữ nghĩa mức cao xuống feature map độ phân giải lớn; PAN đưa thông tin định vị từ P3 trở lại P4/P5. Hai hướng dung hợp tạo một mô hình bổ sung tốt cho FPN thuần khi ensemble.
+
+### 3. Weighted Box Fusion tự cài đặt
+
+Khi chạy nhiều checkpoint hoặc TTA, `--fusion wbf` gom các hộp cùng lớp có IoU cao và tính trung bình tọa độ theo confidence. Khác với NMS chỉ giữ hộp tốt nhất, WBF tận dụng sự đồng thuận về vị trí giữa các mô hình. Vì hiệu quả phụ thuộc dữ liệu, luôn tune và so sánh cả `nms` lẫn `wbf` trên validation trước khi nộp.
 
 Ba head dự đoán độc lập:
 
