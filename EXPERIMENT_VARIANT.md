@@ -7,8 +7,6 @@ Phiên bản này nâng cấp baseline ConvNeXt stride-16 thành detector anchor
 - `P5`, stride 32: vật thể lớn.
 - Mỗi ground-truth box được gán vào scale chính và một scale lân cận.
 - Hỗ trợ backbone `ConvNeXt-Tiny` và `ConvNeXt-Small`.
-- Hỗ trợ neck FPN top-down hoặc PAN-FPN hai chiều tự cài đặt.
-- Hỗ trợ EMA trọng số trong quá trình train.
 - Giữ staged augmentation, Mosaic, multi-scale training, TTA và top-k checkpoints.
 
 ## Mục tiêu thí nghiệm
@@ -38,9 +36,15 @@ python train.py \
   --epochs 60 \
   --batch_size 16 \
   --lr 1e-3 \
+  --weight_decay 3e-4 \
   --backbone tiny \
+  --backbone_lr_scale 0.05 \
+  --class_weight_power 0.5 \
+  --label_smoothing 0.05 \
   --mosaic_prob 0.15 \
-  --close_mosaic_epochs 15 \
+  --close_mosaic_epochs 5 \
+  --val_interval 5 \
+  --dense_val_epochs 10 \
   --save_top_k 5
 ```
 
@@ -56,39 +60,19 @@ python train.py \
   --epochs 60 \
   --batch_size 8 \
   --lr 7e-4 \
+  --weight_decay 3e-4 \
   --backbone small \
+  --backbone_lr_scale 0.05 \
+  --class_weight_power 0.5 \
+  --label_smoothing 0.05 \
   --mosaic_prob 0.15 \
-  --close_mosaic_epochs 15 \
+  --close_mosaic_epochs 5 \
+  --val_interval 5 \
+  --dense_val_epochs 10 \
   --save_top_k 5
 ```
 
 Tiny nên được chạy trước. Chỉ giữ Small nếu official evaluator tăng ổn định, vì backbone lớn hơn tốn VRAM và có nguy cơ overfit cao hơn.
-
-### Thí nghiệm 3: PAN-FPN + EMA, giữ riêng mô hình FPN tốt nhất
-
-```bash
-python train.py \
-  --train_data ./public/annotations/train.json \
-  --val_data ./public/annotations/val.json \
-  --image_dir ./public/train/images \
-  --val_image_dir ./public/val/images \
-  --checkpoint_dir ./models_p3p5_small_pan_ema/ \
-  --epochs 45 \
-  --batch_size 8 \
-  --lr 7e-4 \
-  --weight_decay 2e-4 \
-  --backbone small \
-  --neck pan \
-  --ema_decay 0.9998 \
-  --mosaic_prob 0.15 \
-  --close_mosaic_epochs 5 \
-  --fine_tune_lr_scale 0.25 \
-  --save_top_k 5
-```
-
-Mục tiêu của thí nghiệm này là tạo một mô hình có sai số khác FPN thuần. Hãy đánh giá riêng PAN trước, sau đó tune ensemble FPN + PAN. Không ghi đè checkpoint FPN đã đạt `0.782` trên Kaggle.
-
-Sau khi có PAN, tune ensemble hai lần với `--fusion nms` và `--fusion wbf`. WBF tự cài đặt trung bình tọa độ của các hộp đồng thuận, có thể cải thiện localization của ensemble; chỉ chọn nó khi validation mAP tăng ổn định.
 
 ## Đánh giá
 

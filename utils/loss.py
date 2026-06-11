@@ -25,7 +25,15 @@ class DetectionLoss(nn.Module):
     - Weighted Cross Entropy for class probabilities.
     - Custom CIoU (Complete IoU) Loss + Activated Smooth L1 Loss for bounding boxes.
     """
-    def __init__(self, lambda_obj=5.0, lambda_noobj=0.5, lambda_class=1.0, lambda_box=3.0, class_weights=None):
+    def __init__(
+        self,
+        lambda_obj=5.0,
+        lambda_noobj=0.5,
+        lambda_class=1.0,
+        lambda_box=3.0,
+        class_weights=None,
+        label_smoothing=0.05,
+    ):
         super(DetectionLoss, self).__init__()
         self.lambda_obj = lambda_obj
         self.lambda_noobj = lambda_noobj
@@ -33,7 +41,11 @@ class DetectionLoss(nn.Module):
         self.lambda_box = lambda_box
         
         self.bce_logits = nn.BCEWithLogitsLoss(reduction='none')
-        self.ce_loss = nn.CrossEntropyLoss(weight=class_weights, reduction='sum')
+        self.ce_loss = nn.CrossEntropyLoss(
+            weight=class_weights,
+            reduction='sum',
+            label_smoothing=label_smoothing,
+        )
         self.smooth_l1 = nn.SmoothL1Loss(reduction='sum')
 
     def forward(self, predictions, targets):

@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from predict import load_models, parse_sizes, predict_image_boxes
 from train import compute_ap
-from utils.nms import bbox_iou, postprocess_detections
+from utils.nms import bbox_iou, non_maximum_suppression
 
 
 CLASSES = ["person", "car", "dog", "cat", "chair"]
@@ -28,7 +28,6 @@ def parse_args():
     parser.add_argument("--checkpoint", nargs="+", default=["./models/best.pth"])
     parser.add_argument("--conf_values", default="0.03,0.05,0.08,0.10,0.15,0.20,0.25,0.30")
     parser.add_argument("--iou_values", default="0.40,0.45,0.50,0.55,0.60,0.65")
-    parser.add_argument("--fusion", choices=["nms", "wbf"], default="nms")
     parser.add_argument("--tta_flip", action="store_true")
     parser.add_argument("--tta_sizes", default="448", help="Comma-separated inference sizes")
     return parser.parse_args()
@@ -61,7 +60,7 @@ def predict_raw_for_val(images, image_dir, models, min_conf, use_tta, tta_sizes,
     return predictions
 
 
-def map50_from_dict(images, gt_by_image, raw_predictions, conf_threshold, iou_threshold, fusion):
+def map50_from_dict(images, gt_by_image, raw_predictions, conf_threshold, iou_threshold):
     gt_boxes_by_class = {cls: {} for cls in CLASSES}
     pred_boxes_by_class = {cls: [] for cls in CLASSES}
     gt_counts = {cls: 0 for cls in CLASSES}
@@ -74,7 +73,7 @@ def map50_from_dict(images, gt_by_image, raw_predictions, conf_threshold, iou_th
             gt_counts[cls] += 1
 
         filtered = [box for box in raw_predictions.get(image_id, []) if box["confidence"] >= conf_threshold]
-        final_boxes = postprocess_detections(filtered, iou_threshold=iou_threshold, method=fusion)
+        final_boxes = non_maximum_suppression(filtered, iou_threshold=iou_threshold)
         for box in final_boxes:
             pred_boxes_by_class[box["class"]].append(
                 {"image_id": image_id, "confidence": box["confidence"], "bbox": box["bbox"]}
@@ -128,11 +127,11 @@ def main():
     best = (-1.0, None, None)
     for conf in conf_values:
         for iou in iou_values:
-            score = map50_from_dict(images, gt_by_image, raw_predictions, conf, iou, args.fusion)
-            print(f"fusion={args.fusion} conf={conf:.2f} iou={iou:.2f} mAP@0.5={score:.4f}")
+            score = map50_from_dict(images, gt_by_image, raw_predictions, conf, iou)
+            print(f"conf={conf:.2f} iou={iou:.2f} mAP@0.5={score:.4f}")
             if score > best[0]:
                 best = (score, conf, iou)
-    print(f"BEST fusion={args.fusion} conf={best[1]:.2f} iou={best[2]:.2f} mAP@0.5={best[0]:.4f}")
+    print(f"BEST conf={best[1]:.2f} iou={best[2]:.2f} mAP@0.5={best[0]:.4f}")
 
 
 if __name__ == "__main__":

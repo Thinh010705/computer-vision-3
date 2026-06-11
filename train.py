@@ -1,7 +1,5 @@
 import os
 import argparse
-import copy
-import math
 import random
 import torch
 from torch.utils.data import DataLoader
@@ -25,7 +23,10 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
+    parser.add_argument("--weight_decay", type=float, default=3e-4, help="Weight decay")
+    parser.add_argument("--backbone_lr_scale", type=float, default=0.05, help="Backbone LR as a fraction of the main LR")
+    parser.add_argument("--class_weight_power", type=float, default=0.5, help="Power applied to inverse class frequencies; 0 disables weights")
+    parser.add_argument("--label_smoothing", type=float, default=0.05, help="Label smoothing for classification loss")
     parser.add_argument("--multi_scale", action="store_true", default=True, help="Enable multi-scale training")
     parser.add_argument("--no_multi_scale", action="store_true", help="Disable multi-scale training")
     parser.add_argument("--conf_threshold", type=float, default=0.05, help="Confidence threshold used during validation mAP")
@@ -34,14 +35,12 @@ def parse_args():
     parser.add_argument("--resume", type=str, default=None, help="Optional checkpoint for fine-tuning/resume")
     parser.add_argument("--no_pretrained", action="store_true", help="Initialize ConvNeXt backbone without ImageNet weights")
     parser.add_argument("--backbone", choices=["tiny", "small"], default="tiny", help="ConvNeXt backbone size")
-    parser.add_argument("--neck", choices=["fpn", "pan"], default="fpn", help="Feature fusion neck: top-down FPN or bidirectional PAN-FPN")
     parser.add_argument("--mosaic_prob", type=float, default=0.15, help="Mosaic probability during the strong augmentation phase")
-    parser.add_argument("--close_mosaic_epochs", type=int, default=15, help="Disable mosaic and strong augmentation for final epochs")
+    parser.add_argument("--close_mosaic_epochs", type=int, default=5, help="Disable mosaic and strong augmentation for final epochs")
     parser.add_argument("--fine_tune_lr_scale", type=float, default=0.25, help="Multiply LR when entering final fine-tune phase")
     parser.add_argument("--save_top_k", type=int, default=5, help="Keep top-k checkpoints by validation mAP")
-    parser.add_argument("--ema_decay", type=float, default=0.0, help="EMA decay; set around 0.9998 to enable model EMA")
     parser.add_argument("--val_interval", type=int, default=5, help="Validate every N epochs before the dense validation phase")
-    parser.add_argument("--dense_val_epochs", type=int, default=20, help="Validate every epoch during the final N epochs")
+    parser.add_argument("--dense_val_epochs", type=int, default=10, help="Validate every epoch during the final N epochs")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     return parser.parse_args()
 
@@ -58,27 +57,6 @@ def should_validate(epoch_number, total_epochs, val_interval, dense_val_epochs):
         raise ValueError("--val_interval must be greater than 0")
     dense_start = max(1, total_epochs - max(dense_val_epochs, 0) + 1)
     return epoch_number % val_interval == 0 or epoch_number >= dense_start or epoch_number == total_epochs
-
-
-class ModelEMA:
-    def __init__(self, model, decay=0.9998):
-        self.ema = copy.deepcopy(model).eval()
-        self.decay = decay
-        self.updates = 0
-        for parameter in self.ema.parameters():
-            parameter.requires_grad_(False)
-
-    @torch.no_grad()
-    def update(self, model):
-        self.updates += 1
-        decay = self.decay * (1.0 - math.exp(-self.updates / 2000.0))
-        model_state = model.state_dict()
-        for key, ema_value in self.ema.state_dict().items():
-            model_value = model_state[key].detach()
-            if ema_value.dtype.is_floating_point:
-                ema_value.mul_(decay).add_(model_value, alpha=1.0 - decay)
-            else:
-                ema_value.copy_(model_value)
 
 
 def compute_ap(recalls, precisions):
@@ -227,6 +205,12 @@ def evaluate_map(model, val_loader, device, conf_threshold=0.05, iou_threshold=0
 def train(args):
     set_seed(args.seed)
     args.multi_scale = args.multi_scale and not args.no_multi_scale
+    if not 0.0 <= args.label_smoothing < 1.0:
+        raise ValueError("--label_smoothing must be in [0, 1)")
+    if args.class_weight_power < 0.0:
+        raise ValueError("--class_weight_power must be non-negative")
+    if not 0.0 < args.backbone_lr_scale <= 1.0:
+        raise ValueError("--backbone_lr_scale must be in (0, 1]")
     
     # 1. Setup Directories
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -274,19 +258,20 @@ def train(args):
         if isinstance(resume_checkpoint, dict):
             resume_config = resume_checkpoint.get("model_config", {})
             args.backbone = resume_config.get("backbone", args.backbone)
-            args.neck = resume_config.get("neck", args.neck)
 
     # 4. Instantiate Model, Loss, Optimizer, and Cosine Scheduler
-    model = ConvNeXtFPNDetector(pretrained=not args.no_pretrained, backbone_name=args.backbone, neck_name=args.neck).to(device)
+    model = ConvNeXtFPNDetector(pretrained=not args.no_pretrained, backbone_name=args.backbone).to(device)
     
-    # Inverse-frequency class weights used by the proven baseline.
-    # Frequency counts: person: 5829, car: 1339, dog: 1028, cat: 833, chair: 1613
-    # Absolute counts sum to 10642 annotations. Inverse frequency weights are:
-    class_weights = torch.tensor([1.83, 7.95, 10.35, 12.78, 6.60], dtype=torch.float32).to(device)
-    # Normalize weights so that their mean is 1.0 (sums to num_classes = 5)
-    class_weights = class_weights / class_weights.sum() * 5.0
+    # Tempered inverse-frequency weights reduce imbalance without overfitting
+    # minority-class details that may not transfer to the hidden test split.
+    class_counts = torch.tensor([5829, 1339, 1028, 833, 1613], dtype=torch.float32, device=device)
+    class_weights = class_counts.pow(-args.class_weight_power)
+    class_weights = class_weights / class_weights.mean()
     
-    criterion = DetectionLoss(class_weights=class_weights).to(device)
+    criterion = DetectionLoss(
+        class_weights=class_weights,
+        label_smoothing=args.label_smoothing,
+    ).to(device)
     
     # Differential Learning Rates: fine-tune backbone 10x slower than the head
     backbone_params = []
@@ -298,7 +283,7 @@ def train(args):
             head_params.append(param)
             
     optimizer = torch.optim.AdamW([
-        {"params": backbone_params, "lr": args.lr * 0.1}, # 10x smaller learning rate for backbone parameters
+        {"params": backbone_params, "lr": args.lr * args.backbone_lr_scale},
         {"params": head_params, "lr": args.lr}            # normal learning rate for head parameters
     ], weight_decay=args.weight_decay)
 
@@ -313,11 +298,6 @@ def train(args):
             resume_best_map = float(resume_checkpoint.get("mAP", 0.0))
         else:
             model.load_state_dict(resume_checkpoint)
-
-    ema = ModelEMA(model, args.ema_decay) if args.ema_decay > 0.0 else None
-    if ema is not None and isinstance(resume_checkpoint, dict) and resume_checkpoint.get("ema_state_dict") is not None:
-        ema.ema.load_state_dict(resume_checkpoint["ema_state_dict"])
-        ema.updates = int(resume_checkpoint.get("ema_updates", 0))
 
     # Cosine learning rate decay for smooth convergence
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -336,7 +316,6 @@ def train(args):
     model_config = {
         "detector": "ConvNeXtFPNDetector",
         "backbone": args.backbone,
-        "neck": args.neck,
         "model_version": getattr(model, "model_version", "unknown"),
         "strides": list(getattr(model, "strides", (8, 16, 32))),
     }
@@ -378,7 +357,7 @@ def train(args):
                 factor = (global_step + 1) / total_warmup_steps
                 for g_idx, g in enumerate(optimizer.param_groups):
                     # g_idx 0 is backbone, g_idx 1 is head
-                    base_lr = args.lr * 0.1 if g_idx == 0 else args.lr
+                    base_lr = args.lr * args.backbone_lr_scale if g_idx == 0 else args.lr
                     g['lr'] = base_lr * factor
             
             optimizer.zero_grad(set_to_none=True)
@@ -403,8 +382,6 @@ def train(args):
             
             scaler.step(optimizer)
             scaler.update()
-            if ema is not None:
-                ema.update(model)
             
             epoch_loss += loss.item()
             progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
@@ -412,7 +389,6 @@ def train(args):
         scheduler.step()
         avg_train_loss = epoch_loss / len(train_loader)
         
-        eval_model = ema.ema if ema is not None else model
         epoch_number = epoch + 1
         run_validation = should_validate(epoch_number, args.epochs, args.val_interval, args.dense_val_epochs)
 
@@ -420,7 +396,7 @@ def train(args):
         if run_validation:
             print("Calculating Validation mAP@0.5...")
             val_map = evaluate_map(
-                eval_model,
+                model,
                 val_loader,
                 device,
                 conf_threshold=args.conf_threshold,
@@ -433,7 +409,7 @@ def train(args):
                 best_path = os.path.join(args.checkpoint_dir, "best.pth")
                 torch.save({
                     'epoch': epoch,
-                    'model_state_dict': eval_model.state_dict(),
+                    'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'mAP': val_map,
                     'conf_threshold': args.conf_threshold,
@@ -445,7 +421,7 @@ def train(args):
             top_path = os.path.join(args.checkpoint_dir, f"epoch_{epoch_number:03d}_map_{val_map:.4f}.pth")
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': eval_model.state_dict(),
+                'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'mAP': val_map,
                 'model_config': model_config,
@@ -472,8 +448,6 @@ def train(args):
             'conf_threshold': args.conf_threshold,
             'iou_threshold': args.iou_threshold,
             'model_config': model_config,
-            'ema_state_dict': ema.ema.state_dict() if ema is not None else None,
-            'ema_updates': ema.updates if ema is not None else 0,
         }, latest_path)
 
     print(f"\nTraining completed! Best Validation mAP@0.5 = {best_map:.4f}")

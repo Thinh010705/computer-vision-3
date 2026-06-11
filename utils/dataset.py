@@ -55,22 +55,24 @@ class DetectionDataset(Dataset):
         elif self.training_stage == "fine":
             transforms = [
                 A.HorizontalFlip(p=0.5),
+                A.Affine(scale=(0.97, 1.03), translate_percent=(-0.02, 0.02), rotate=(-3, 3), border_mode=0, p=0.20),
                 A.Resize(self.resolution, self.resolution),
-                A.RandomBrightnessContrast(brightness_limit=0.10, contrast_limit=0.10, p=0.25),
-                A.HueSaturationValue(hue_shift_limit=5, sat_shift_limit=8, val_shift_limit=8, p=0.20),
+                A.RandomBrightnessContrast(brightness_limit=0.12, contrast_limit=0.12, p=0.30),
+                A.HueSaturationValue(hue_shift_limit=6, sat_shift_limit=10, val_shift_limit=10, p=0.25),
+                A.GaussNoise(p=0.04),
             ]
             min_visibility = 0.3
         else:
             transforms = [
                 A.HorizontalFlip(p=0.5),
-                A.RandomResizedCrop(size=(self.resolution, self.resolution), scale=(0.9, 1.0), ratio=(0.95, 1.05), p=0.35),
+                A.RandomResizedCrop(size=(self.resolution, self.resolution), scale=(0.85, 1.0), ratio=(0.90, 1.10), p=0.40),
                 A.Resize(self.resolution, self.resolution),
                 A.Affine(scale=(0.95, 1.05), translate_percent=(-0.03, 0.03), rotate=(-5, 5), shear=(-3, 3), border_mode=0, p=0.30),
                 A.CLAHE(clip_limit=2.0, p=0.15),
                 A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.15, p=0.35),
                 A.HueSaturationValue(hue_shift_limit=8, sat_shift_limit=12, val_shift_limit=12, p=0.30),
                 A.GaussNoise(p=0.08),
-                A.CoarseDropout(num_holes_range=(1, 4), hole_height_range=(6, 16), hole_width_range=(6, 16), p=0.10),
+                A.CoarseDropout(num_holes_range=(1, 5), hole_height_range=(6, 20), hole_width_range=(6, 20), p=0.12),
             ]
             min_visibility = 0.3
 
