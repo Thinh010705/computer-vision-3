@@ -79,8 +79,18 @@ python train.py \
   --mosaic_prob 0.15 \
   --close_mosaic_epochs 15 \
   --fine_tune_lr_scale 0.25 \
+  --val_interval 5 \
+  --dense_val_epochs 20 \
   --save_top_k 5
 ```
+
+Theo cấu hình này, validation mAP được tính mỗi 5 epoch trong giai đoạn
+đầu và được tính sau mỗi epoch trong 20 epoch cuối. Epoch cuối luôn được
+đánh giá. `latest.pth` vẫn được lưu sau mọi epoch, còn `best.pth` và
+top-k checkpoint chỉ được cập nhật tại các epoch có chạy validation.
+
+- `--val_interval 5`: khoảng cách validation trong giai đoạn đầu.
+- `--dense_val_epochs 20`: số epoch cuối được validation liên tục.
 
 #### Cấu hình thử nghiệm với ConvNeXt-Small
 

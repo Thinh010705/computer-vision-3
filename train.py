@@ -40,6 +40,8 @@ def parse_args():
     parser.add_argument("--fine_tune_lr_scale", type=float, default=0.25, help="Multiply LR when entering final fine-tune phase")
     parser.add_argument("--save_top_k", type=int, default=5, help="Keep top-k checkpoints by validation mAP")
     parser.add_argument("--ema_decay", type=float, default=0.0, help="EMA decay; set around 0.9998 to enable model EMA")
+    parser.add_argument("--val_interval", type=int, default=5, help="Validate every N epochs before the dense validation phase")
+    parser.add_argument("--dense_val_epochs", type=int, default=20, help="Validate every epoch during the final N epochs")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     return parser.parse_args()
 
@@ -49,6 +51,13 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def should_validate(epoch_number, total_epochs, val_interval, dense_val_epochs):
+    if val_interval <= 0:
+        raise ValueError("--val_interval must be greater than 0")
+    dense_start = max(1, total_epochs - max(dense_val_epochs, 0) + 1)
+    return epoch_number % val_interval == 0 or epoch_number >= dense_start or epoch_number == total_epochs
 
 
 class ModelEMA:
@@ -403,50 +412,63 @@ def train(args):
         scheduler.step()
         avg_train_loss = epoch_loss / len(train_loader)
         
-        # 6. Evaluation Phase
-        print(f"Calculating Validation mAP@0.5...")
         eval_model = ema.ema if ema is not None else model
-        val_map = evaluate_map(eval_model, val_loader, device, conf_threshold=args.conf_threshold, iou_threshold=args.iou_threshold)
-        
-        print(f"Epoch {epoch+1} Summary: Avg Train Loss = {avg_train_loss:.4f} | Val mAP@0.5 = {val_map:.4f}")
-        
-        # 7. Checkpoint Saving (Save best checkpoint)
-        if val_map > best_map:
-            best_map = val_map
-            best_path = os.path.join(args.checkpoint_dir, "best.pth")
+        epoch_number = epoch + 1
+        run_validation = should_validate(epoch_number, args.epochs, args.val_interval, args.dense_val_epochs)
+
+        # 6. Evaluation and ranked checkpoint saving only on scheduled epochs.
+        if run_validation:
+            print("Calculating Validation mAP@0.5...")
+            val_map = evaluate_map(
+                eval_model,
+                val_loader,
+                device,
+                conf_threshold=args.conf_threshold,
+                iou_threshold=args.iou_threshold,
+            )
+            print(f"Epoch {epoch_number} Summary: Avg Train Loss = {avg_train_loss:.4f} | Val mAP@0.5 = {val_map:.4f}")
+
+            if val_map > best_map:
+                best_map = val_map
+                best_path = os.path.join(args.checkpoint_dir, "best.pth")
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': eval_model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'mAP': val_map,
+                    'conf_threshold': args.conf_threshold,
+                    'iou_threshold': args.iou_threshold,
+                    'model_config': model_config,
+                }, best_path)
+                print(f"⭐ New Best Model saved with mAP@0.5 = {val_map:.4f} at {best_path}")
+
+            top_path = os.path.join(args.checkpoint_dir, f"epoch_{epoch_number:03d}_map_{val_map:.4f}.pth")
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': eval_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'mAP': val_map,
-                'conf_threshold': args.conf_threshold,
-                'iou_threshold': args.iou_threshold,
                 'model_config': model_config,
-            }, best_path)
-            print(f"⭐ New Best Model saved with mAP@0.5 = {val_map:.4f} at {best_path}")
-
-        top_path = os.path.join(args.checkpoint_dir, f"epoch_{epoch + 1:03d}_map_{val_map:.4f}.pth")
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': eval_model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'mAP': val_map,
-            'model_config': model_config,
-        }, top_path)
-        top_checkpoints.append((val_map, top_path))
-        top_checkpoints.sort(key=lambda item: item[0], reverse=True)
-        while len(top_checkpoints) > args.save_top_k:
-            _, remove_path = top_checkpoints.pop()
-            if os.path.exists(remove_path):
-                os.remove(remove_path)
+            }, top_path)
+            top_checkpoints.append((val_map, top_path))
+            top_checkpoints.sort(key=lambda item: item[0], reverse=True)
+            while len(top_checkpoints) > args.save_top_k:
+                _, remove_path = top_checkpoints.pop()
+                if os.path.exists(remove_path):
+                    os.remove(remove_path)
+        else:
+            print(
+                f"Epoch {epoch_number} Summary: Avg Train Loss = {avg_train_loss:.4f} | "
+                f"Validation skipped | Best mAP@0.5 = {best_map:.4f}"
+            )
             
-        # Also save latest checkpoint
+        # Always save latest so training can resume even when validation is skipped.
         latest_path = os.path.join(args.checkpoint_dir, "latest.pth")
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'mAP': val_map,
+            'mAP': best_map,
             'conf_threshold': args.conf_threshold,
             'iou_threshold': args.iou_threshold,
             'model_config': model_config,
