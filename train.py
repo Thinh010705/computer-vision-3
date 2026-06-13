@@ -22,6 +22,8 @@ def parse_args():
     # Tham sô huấn luyện và đánh giá
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
+    parser.add_argument("--image_size", type=int, default=448, help="Base and final fine-tune image size; must be divisible by 32")
+    parser.add_argument("--multi_scale_sizes", default="416,448,480", help="Comma-separated multi-scale train sizes")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=3e-4, help="Weight decay")
     parser.add_argument("--backbone_lr_scale", type=float, default=0.05, help="Backbone LR as a fraction of the main LR")
@@ -33,15 +35,19 @@ def parse_args():
     parser.add_argument("--iou_threshold", type=float, default=0.50, help="NMS IoU threshold used during validation mAP")
     parser.add_argument("--num_workers", type=int, default=2, help="DataLoader workers")
     parser.add_argument("--resume", type=str, default=None, help="Optional checkpoint for fine-tuning/resume")
+    parser.add_argument("--resume_weights_only", action="store_true", help="Load model weights but restart optimizer and epoch count")
     parser.add_argument("--no_pretrained", action="store_true", help="Initialize ConvNeXt backbone without ImageNet weights")
     parser.add_argument("--backbone", choices=["tiny", "small"], default="tiny", help="ConvNeXt backbone size")
     parser.add_argument("--mosaic_prob", type=float, default=0.15, help="Mosaic probability during the strong augmentation phase")
     parser.add_argument("--close_mosaic_epochs", type=int, default=5, help="Disable mosaic and strong augmentation for final epochs")
     parser.add_argument("--fine_tune_lr_scale", type=float, default=0.25, help="Multiply LR when entering final fine-tune phase")
+    parser.add_argument("--fine_tune_only", action="store_true", help="Use light augmentation for every epoch without applying an extra LR reduction")
     parser.add_argument("--save_top_k", type=int, default=5, help="Keep top-k checkpoints by validation mAP")
     parser.add_argument("--val_interval", type=int, default=5, help="Validate every N epochs before the dense validation phase")
     parser.add_argument("--dense_val_epochs", type=int, default=10, help="Validate every epoch during the final N epochs")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--iou_obj_ratio", type=float, default=0.75, help="Blend ratio from binary to IoU-aware positive objectness target")
+    parser.add_argument("--no_iou_aware_obj", action="store_true", help="Use binary positive objectness targets for baseline comparison")
     return parser.parse_args()
 
 def set_seed(seed):
@@ -50,6 +56,13 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def parse_image_sizes(value):
+    sizes = [int(item.strip()) for item in value.split(",") if item.strip()]
+    if not sizes or any(size <= 0 or size % 32 != 0 for size in sizes):
+        raise ValueError("Image sizes must be positive multiples of 32.")
+    return sizes
 
 
 def should_validate(epoch_number, total_epochs, val_interval, dense_val_epochs):
@@ -205,12 +218,17 @@ def evaluate_map(model, val_loader, device, conf_threshold=0.05, iou_threshold=0
 def train(args):
     set_seed(args.seed)
     args.multi_scale = args.multi_scale and not args.no_multi_scale
+    scales = parse_image_sizes(args.multi_scale_sizes)
+    if args.image_size <= 0 or args.image_size % 32 != 0:
+        raise ValueError("--image_size must be a positive multiple of 32")
     if not 0.0 <= args.label_smoothing < 1.0:
         raise ValueError("--label_smoothing must be in [0, 1)")
     if args.class_weight_power < 0.0:
         raise ValueError("--class_weight_power must be non-negative")
     if not 0.0 < args.backbone_lr_scale <= 1.0:
         raise ValueError("--backbone_lr_scale must be in (0, 1]")
+    if not 0.0 <= args.iou_obj_ratio <= 1.0:
+        raise ValueError("--iou_obj_ratio must be in [0, 1]")
     
     # 1. Setup Directories
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -218,11 +236,9 @@ def train(args):
     # 2. Setup Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    
     # 3. Create Datasets
-    # Default resolution is 448, yielding P3/P4/P5 grids 56x56, 28x28, 14x14.
-    train_dataset = DetectionDataset(args.train_data, args.image_dir, resolution=448, is_train=True)
-    val_dataset = DetectionDataset(args.val_data, args.val_image_dir, resolution=448, is_train=False)
+    train_dataset = DetectionDataset(args.train_data, args.image_dir, resolution=args.image_size, is_train=True)
+    val_dataset = DetectionDataset(args.val_data, args.val_image_dir, resolution=args.image_size, is_train=False)
     train_dataset.base_mosaic_prob = args.mosaic_prob
     train_dataset.set_training_stage("strong")
     
@@ -258,9 +274,18 @@ def train(args):
         if isinstance(resume_checkpoint, dict):
             resume_config = resume_checkpoint.get("model_config", {})
             args.backbone = resume_config.get("backbone", args.backbone)
+    print(
+        "Training configuration: "
+        f"backbone={args.backbone}, image_size={args.image_size}, "
+        f"multi_scale={args.multi_scale}, iou_aware_obj={not args.no_iou_aware_obj}, "
+        f"iou_obj_ratio={args.iou_obj_ratio:.2f}"
+    )
 
     # 4. Instantiate Model, Loss, Optimizer, and Cosine Scheduler
-    model = ConvNeXtFPNDetector(pretrained=not args.no_pretrained, backbone_name=args.backbone).to(device)
+    # A resume checkpoint already contains backbone weights, so avoid downloading
+    # ImageNet weights again when starting a resume/fine-tune run.
+    use_pretrained = not args.no_pretrained and resume_checkpoint is None
+    model = ConvNeXtFPNDetector(pretrained=use_pretrained, backbone_name=args.backbone).to(device)
     
     # Tempered inverse-frequency weights reduce imbalance without overfitting
     # minority-class details that may not transfer to the hidden test split.
@@ -271,6 +296,8 @@ def train(args):
     criterion = DetectionLoss(
         class_weights=class_weights,
         label_smoothing=args.label_smoothing,
+        iou_aware_obj=not args.no_iou_aware_obj,
+        iou_obj_ratio=args.iou_obj_ratio,
     ).to(device)
     
     # Differential Learning Rates: fine-tune backbone 10x slower than the head
@@ -292,10 +319,11 @@ def train(args):
     if resume_checkpoint is not None:
         if isinstance(resume_checkpoint, dict) and "model_state_dict" in resume_checkpoint:
             model.load_state_dict(resume_checkpoint["model_state_dict"])
-            if "optimizer_state_dict" in resume_checkpoint:
+            if "optimizer_state_dict" in resume_checkpoint and not args.resume_weights_only:
                 optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
-            start_epoch = int(resume_checkpoint.get("epoch", -1)) + 1
-            resume_best_map = float(resume_checkpoint.get("mAP", 0.0))
+            if not args.resume_weights_only:
+                start_epoch = int(resume_checkpoint.get("epoch", -1)) + 1
+                resume_best_map = float(resume_checkpoint.get("mAP", 0.0))
         else:
             model.load_state_dict(resume_checkpoint)
 
@@ -309,7 +337,6 @@ def train(args):
         scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
         
     best_map = resume_best_map
-    scales = [416, 448, 480]
     fine_start_epoch = max(0, args.epochs - args.close_mosaic_epochs)
     fine_lr_applied = False
     top_checkpoints = []
@@ -318,20 +345,24 @@ def train(args):
         "backbone": args.backbone,
         "model_version": getattr(model, "model_version", "unknown"),
         "strides": list(getattr(model, "strides", (8, 16, 32))),
+        "image_size": args.image_size,
+        "iou_aware_obj": not args.no_iou_aware_obj,
+        "iou_obj_ratio": args.iou_obj_ratio,
+        "fine_tune_only": args.fine_tune_only,
     }
     
     for epoch in range(start_epoch, args.epochs):
         model.train()
 
-        fine_phase = epoch >= fine_start_epoch
+        fine_phase = args.fine_tune_only or epoch >= fine_start_epoch
         if fine_phase:
             train_dataset.set_training_stage("fine")
-            train_dataset.set_resolution(448)
-            if not fine_lr_applied:
+            train_dataset.set_resolution(args.image_size)
+            if not fine_lr_applied and not args.fine_tune_only:
                 for group in optimizer.param_groups:
                     group["lr"] *= args.fine_tune_lr_scale
                 fine_lr_applied = True
-            print(f"\n--- Epoch {epoch+1}/{args.epochs} | Fine-tune phase: mosaic OFF, light augmentation, 448x448 ---")
+            print(f"\n--- Epoch {epoch+1}/{args.epochs} | Fine-tune phase: mosaic OFF, light augmentation, {args.image_size}x{args.image_size} ---")
         elif args.multi_scale and torch.cuda.is_available():
             train_dataset.set_training_stage("strong")
             new_res = random.choice(scales)
@@ -339,8 +370,8 @@ def train(args):
             print(f"\n--- Epoch {epoch+1}/{args.epochs} | Multi-scale target resolution set to: {new_res}x{new_res} ---")
         else:
             train_dataset.set_training_stage("strong")
-            train_dataset.set_resolution(448)
-            print(f"\n--- Epoch {epoch+1}/{args.epochs} | Target resolution: 448x448 ---")
+            train_dataset.set_resolution(args.image_size)
+            print(f"\n--- Epoch {epoch+1}/{args.epochs} | Target resolution: {args.image_size}x{args.image_size} ---")
             
         epoch_loss = 0.0
         progress_bar = tqdm(train_loader, desc=f"Training Epoch {epoch+1}")

@@ -123,6 +123,118 @@ python train.py \
 
 ConvNeXt-Small có khả năng biểu diễn mạnh hơn nhưng tốn nhiều VRAM và có nguy cơ overfit cao hơn. Nên huấn luyện ConvNeXt-Tiny trước để đo lợi ích của kiến trúc đa tỉ lệ, sau đó mới so sánh với Small bằng cùng evaluator.
 
+#### Lộ trình thử nghiệm để cải thiện hidden-test mAP
+
+Phiên bản hiện tại mặc định dùng **IoU-aware objectness**. Với ô chứa vật
+thể, mục tiêu objectness được pha trộn giữa `1.0` và IoU của hộp dự đoán:
+
+```text
+quality_target = 0.25 + 0.75 * IoU(predicted_box, ground_truth_box)
+confidence = sigmoid(objectness) * softmax(class)
+```
+
+Cơ chế này giúp confidence phản ánh cả khả năng có vật thể và chất lượng
+định vị hộp. Vì AP phụ thuộc vào thứ tự confidence, hộp định vị tốt sẽ có
+khả năng được xếp trên hộp định vị kém. Có thể chạy baseline objectness nhị
+phân bằng cờ `--no_iou_aware_obj`.
+
+Huấn luyện ba ConvNeXt-Small khác seed, giữ nguyên các tham số còn lại:
+
+```bash
+# Lần 1: --checkpoint_dir ./models_small_seed42/   --seed 42
+# Lần 2: --checkpoint_dir ./models_small_seed3407/ --seed 3407
+# Lần 3: --checkpoint_dir ./models_small_seed2026/ --seed 2026
+python train.py \
+  --train_data ./public/annotations/train.json \
+  --val_data ./public/annotations/val.json \
+  --image_dir ./public/train/images \
+  --val_image_dir ./public/val/images \
+  --checkpoint_dir ./models_small_seed42/ \
+  --epochs 60 \
+  --batch_size 8 \
+  --image_size 448 \
+  --multi_scale_sizes 416,448,480 \
+  --lr 7e-4 \
+  --weight_decay 3e-4 \
+  --backbone small \
+  --backbone_lr_scale 0.05 \
+  --class_weight_power 0.5 \
+  --label_smoothing 0.05 \
+  --iou_obj_ratio 0.75 \
+  --mosaic_prob 0.15 \
+  --close_mosaic_epochs 5 \
+  --fine_tune_lr_scale 0.25 \
+  --val_interval 5 \
+  --dense_val_epochs 10 \
+  --save_top_k 5 \
+  --seed 42
+```
+
+Fine-tune một checkpoint tốt ở `512 x 512` trong một lượt huấn luyện mới.
+`--resume_weights_only` chỉ nạp trọng số, không nạp optimizer hoặc số epoch;
+`--fine_tune_only` dùng augmentation nhẹ và tắt mosaic trong toàn bộ lượt:
+
+```bash
+python train.py \
+  --train_data ./public/annotations/train.json \
+  --val_data ./public/annotations/val.json \
+  --image_dir ./public/train/images \
+  --val_image_dir ./public/val/images \
+  --checkpoint_dir ./models_small_seed42_512/ \
+  --resume ./models_small_seed42/best.pth \
+  --resume_weights_only \
+  --fine_tune_only \
+  --epochs 12 \
+  --batch_size 4 \
+  --image_size 512 \
+  --no_multi_scale \
+  --lr 1e-4 \
+  --weight_decay 1e-4 \
+  --backbone small \
+  --backbone_lr_scale 0.05 \
+  --class_weight_power 0.5 \
+  --label_smoothing 0.05 \
+  --iou_obj_ratio 0.75 \
+  --val_interval 1 \
+  --dense_val_epochs 12 \
+  --save_top_k 3
+```
+
+Tune threshold cho ensemble khác seed trước. Chỉ thêm TTA `448,512` nếu kết
+quả validation tăng ổn định so với TTA flip đơn:
+
+```bash
+python tune_thresholds.py \
+  --val_data ./public/annotations/val.json \
+  --val_image_dir ./public/val/images \
+  --checkpoint \
+    ./models_small_seed42/best.pth \
+    ./models_small_seed3407/best.pth \
+    ./models_small_seed2026/best.pth \
+  --conf_values 0.01,0.02,0.03,0.05,0.08,0.10 \
+  --iou_values 0.45,0.50,0.55,0.60 \
+  --tta_flip
+```
+
+Sau khi chọn threshold, suy luận tập test với đúng checkpoint và TTA đã tune:
+
+```bash
+python predict.py \
+  --image_dir /path/to/test/images \
+  --output predictions.json \
+  --checkpoint \
+    ./models_small_seed42/best.pth \
+    ./models_small_seed3407/best.pth \
+    ./models_small_seed2026/best.pth \
+  --conf_threshold <BEST_CONF> \
+  --iou_threshold <BEST_IOU> \
+  --tta_flip
+```
+
+Không có cấu hình nào bảo đảm đạt `0.8`. Nên nộp từng bước: single Small mới,
+Small fine-tune 512, ensemble hai seed, rồi ensemble ba seed. Giữ lại cấu
+hình `0.782` làm baseline để tránh chọn cấu hình chỉ tăng trên validation.
+
 #### Cấu hình ưu tiên khả năng tổng quát trên hidden test
 
 Cấu hình này giảm việc học quá sát validation bằng regularization mạnh hơn,
@@ -328,11 +440,12 @@ Mỗi scale sử dụng hai nhánh riêng:
 
 Việc tách nhánh giúp giảm xung đột giữa nhiệm vụ phân lớp và định vị. Các head sử dụng **depthwise-separable convolution tự cài đặt** để giảm FLOPs và bộ nhớ, đặc biệt quan trọng với lưới P3 `56 x 56`.
 
-### 5. Hàm mất mát Focal Loss, Weighted CE, CIoU và Smooth L1
+### 5. Hàm mất mát IoU-Aware Objectness, Focal Loss, Weighted CE, CIoU và Smooth L1
 
 Hàm mất mát gồm:
 
-- **Focal Loss** cho objectness, giúp giảm ảnh hưởng của số lượng lớn background cell.
+- **IoU-aware BCE** cho positive objectness, giúp confidence phản ánh chất lượng định vị hộp.
+- **Focal Loss** cho background objectness, giảm ảnh hưởng của số lượng lớn background cell.
 - **Weighted Cross Entropy** cho phân lớp, xử lý mất cân bằng giữa 5 lớp.
 - **CIoU Loss** cho hộp bao, tối ưu độ chồng lắp, khoảng cách tâm và tỷ lệ khung hình.
 - **Smooth L1 Loss** hỗ trợ ổn định quá trình học tọa độ.
@@ -351,10 +464,10 @@ Trong giai đoạn đầu, mô hình sử dụng:
 - Gaussian Noise và CoarseDropout.
 - Multi-scale training tại `416`, `448`, `480`.
 
-Trong `15` epoch cuối:
+Trong số epoch cuối được cấu hình bởi `--close_mosaic_epochs`:
 
 - Tắt Mosaic.
-- Cố định kích thước `448 x 448`.
+- Cố định kích thước theo `--image_size`.
 - Chỉ giữ augmentation nhẹ.
 - Giảm learning rate để fine-tune trên phân phối gần ảnh thật.
 

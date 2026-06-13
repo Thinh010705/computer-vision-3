@@ -33,12 +33,16 @@ class DetectionLoss(nn.Module):
         lambda_box=3.0,
         class_weights=None,
         label_smoothing=0.05,
+        iou_aware_obj=True,
+        iou_obj_ratio=0.75,
     ):
         super(DetectionLoss, self).__init__()
         self.lambda_obj = lambda_obj
         self.lambda_noobj = lambda_noobj
         self.lambda_class = lambda_class
         self.lambda_box = lambda_box
+        self.iou_aware_obj = iou_aware_obj
+        self.iou_obj_ratio = iou_obj_ratio
         
         self.bce_logits = nn.BCEWithLogitsLoss(reduction='none')
         self.ce_loss = nn.CrossEntropyLoss(
@@ -75,20 +79,17 @@ class DetectionLoss(nn.Module):
         obj_mask = (target_obj == 1.0)
         noobj_mask = (target_obj == 0.0)
         
-        # 1. Objectness Loss (Focal Loss to handle extreme background cell imbalance)
-        loss_obj_all = focal_loss_with_logits(pred_obj, target_obj, alpha=0.25, gamma=2.0)
-        loss_obj = loss_obj_all[obj_mask].sum() if obj_mask.sum() > 0 else 0.0
-        loss_noobj = loss_obj_all[noobj_mask].sum()
-        
-        # Grid Normalization: scale objectness loss relative to standard 448x448 grid size (S=28, S^2=784)
-        grid_normalization = (S * S) / 784.0
-        total_obj_loss = (self.lambda_obj * loss_obj + self.lambda_noobj * loss_noobj) / grid_normalization
-        
         # Check if there are any objects in this batch
         num_pos = obj_mask.sum().item()
         if num_pos == 0:
-            # If no objects, return only background classification loss
-            return total_obj_loss / batch_size
+            loss_noobj = focal_loss_with_logits(
+                pred_obj[noobj_mask],
+                target_obj[noobj_mask],
+                alpha=0.25,
+                gamma=2.0,
+            ).sum()
+            grid_normalization = (S * S) / 784.0
+            return (self.lambda_noobj * loss_noobj / grid_normalization) / batch_size
             
         # 2. Classification Loss (Cross Entropy Loss)
         # Extract class logits for grid cells containing objects
@@ -146,6 +147,34 @@ class DetectionLoss(nn.Module):
         
         # IoU
         iou = inter_area / union_area
+
+        # IoU-aware objectness ranks accurately localized boxes above weaker boxes.
+        # Blending IoU with the original positive target keeps gradients useful
+        # during early training when predicted boxes still have low overlap.
+        if self.iou_aware_obj:
+            quality_target = (1.0 - self.iou_obj_ratio) + self.iou_obj_ratio * iou.detach()
+            # Weight high-quality positives more strongly. This makes the score
+            # useful for AP ranking without letting poorly localized positives
+            # dominate the objectness branch early in training.
+            loss_obj = (self.bce_logits(pred_obj[obj_mask], quality_target) * quality_target).sum()
+        else:
+            quality_target = torch.ones_like(iou)
+            loss_obj = focal_loss_with_logits(
+                pred_obj[obj_mask],
+                quality_target,
+                alpha=0.25,
+                gamma=2.0,
+            ).sum()
+        loss_noobj = focal_loss_with_logits(
+            pred_obj[noobj_mask],
+            target_obj[noobj_mask],
+            alpha=0.25,
+            gamma=2.0,
+        ).sum()
+
+        # Normalize objectness relative to a stride-16 grid at the base 448 size.
+        grid_normalization = (S * S) / 784.0
+        total_obj_loss = (self.lambda_obj * loss_obj + self.lambda_noobj * loss_noobj) / grid_normalization
         
         # CIoU terms: distance regularization + aspect ratio similarity
         # 1. Square distance of box centers

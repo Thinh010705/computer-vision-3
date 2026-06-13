@@ -127,9 +127,14 @@ Như vậy mô hình hoạt động theo hướng anchor-free, dự đoán trự
 
 ### 6.1. Objectness loss
 
-Phần objectness dùng focal loss để giảm ảnh hưởng của các cell nền. Đây là điểm rất quan trọng vì trên grid số lượng ô không có vật thể thường lớn hơn rất nhiều so với ô có vật thể.
+Phần objectness dùng hai cơ chế. Với cell nền, focal loss giảm ảnh hưởng của
+số lượng lớn background dễ. Với cell positive, mục tiêu objectness được pha
+trộn giữa `1.0` và IoU của hộp dự đoán với ground truth. Vì vậy confidence
+không chỉ biểu diễn khả năng có vật thể mà còn phản ánh chất lượng định vị.
 
-Focal loss giúp mô hình tập trung hơn vào các mẫu khó thay vì bị chi phối bởi quá nhiều background dễ.
+Mục tiêu IoU được `detach` trước khi tính objectness loss, vì vậy nhánh
+objectness học cách ước lượng chất lượng hộp nhưng không tạo đường gradient
+phụ can thiệp trực tiếp vào nhánh regression.
 
 ### 6.2. Class loss
 
