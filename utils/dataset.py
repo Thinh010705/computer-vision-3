@@ -15,7 +15,10 @@ STRIDES = (8, 16, 32)
 
 
 class DetectionDataset(Dataset):
+    """Đọc JSON của đề bài và tạo tensor ảnh cùng target P3/P4/P5."""
+
     def __init__(self, json_path, image_dir, resolution=448, is_train=True):
+        """Đọc annotation, lập chỉ mục ảnh và khởi tạo chính sách biến đổi."""
         self.image_dir = image_dir
         self.is_train = is_train
         self.resolution = resolution
@@ -49,6 +52,7 @@ class DetectionDataset(Dataset):
         self._build_transform()
 
     def _build_transform(self):
+        """Tạo phép biến đổi cho validation, train mạnh hoặc fine-tune cuối."""
         if not self.is_train:
             transforms = [A.Resize(self.resolution, self.resolution)]
             min_visibility = 0.0
@@ -86,25 +90,35 @@ class DetectionDataset(Dataset):
         )
 
     def set_training_stage(self, stage):
+        """Đổi chính sách augmentation và tắt Mosaic trong giai đoạn cuối."""
         self.training_stage = stage
         self.mosaic_prob = 0.0 if stage == "fine" else self.base_mosaic_prob
         self._build_transform()
 
     def set_resolution(self, resolution):
+        """Tạo lại transform khi multi-scale thay đổi độ phân giải ảnh."""
         self.resolution = resolution
         self._build_transform()
 
     def __len__(self):
+        """Trả về số ảnh trong tập dữ liệu."""
         return len(self.examples)
 
     def _load_raw_example(self, idx):
+        """Đọc ảnh RGB và sao chép box/label để augmentation không sửa dữ liệu gốc."""
         example = self.examples[idx]
         path = os.path.join(self.image_dir, os.path.basename(example["file_name"]))
         image = np.array(Image.open(path).convert("RGB"))
         return image, list(example["bboxes"]), list(example["labels"])
 
     def _load_mosaic(self, idx):
-        indices = [idx] + random.sample(range(len(self.examples)), 3)
+        """Ghép bốn ảnh rồi cắt ngẫu nhiên một vùng có kích thước train."""
+        # Canvas 2x2 tăng mật độ vật thể và tạo thêm biến thiên về tỉ lệ.
+        indices = [idx]
+        while len(indices) < 4:
+            sample_idx = random.randrange(len(self.examples))
+            if sample_idx not in indices:
+                indices.append(sample_idx)
         out_size = self.resolution * 2
         mosaic = np.full((out_size, out_size, 3), 114, dtype=np.uint8)
         boxes_all, labels_all = [], []
@@ -138,7 +152,8 @@ class DetectionDataset(Dataset):
 
     @staticmethod
     def _assigned_scales(width, height):
-        # Primary scale from the longest normalized side, plus one adjacent scale.
+        """Gán mỗi vật thể vào một tầng FPN chính và một tầng lân cận."""
+        # Cạnh chuẩn hóa dài nhất là tiêu chí đơn giản để chọn tầng anchor-free.
         longest = max(width, height)
         if longest < 0.18:
             return (0, 1)
@@ -147,6 +162,7 @@ class DetectionDataset(Dataset):
         return (2, 1)
 
     def _build_targets(self, bboxes, labels):
+        """Mã hóa hộp thành target lưới 10 kênh tại stride 8, 16 và 32."""
         targets, occupied_areas = [], []
         for stride in STRIDES:
             size = self.resolution // stride
@@ -167,14 +183,15 @@ class DetectionDataset(Dataset):
                 target = targets[scale_idx]
                 size = target.shape[-1]
                 col, row = int(xc * size), int(yc * size)
-                # Multi-scale assignment greatly reduces collisions. If a collision
-                # remains, retain the smaller object because it is harder to recover.
+                # Gán đa tỉ lệ giảm xung đột target. Nếu vẫn trùng ô, ưu tiên vật
+                # thể nhỏ hơn vì đối tượng nhỏ thường khó phát hiện hơn.
                 if area >= occupied_areas[scale_idx][row, col]:
                     continue
                 occupied_areas[scale_idx][row, col] = area
                 target[:, row, col] = 0.0
                 target[0, row, col] = 1.0
                 target[1 + int(label), row, col] = 1.0
+                # Offset tâm tương đối theo ô; width/height tương đối theo toàn ảnh.
                 target[6, row, col] = xc * size - col
                 target[7, row, col] = yc * size - row
                 target[8, row, col] = width
@@ -182,6 +199,7 @@ class DetectionDataset(Dataset):
         return targets
 
     def __getitem__(self, idx):
+        """Đọc, augmentation, mã hóa và trả về mẫu cùng metadata ảnh gốc."""
         example = self.examples[idx]
         if self.is_train and random.random() < self.mosaic_prob:
             image, boxes, labels = self._load_mosaic(idx)
@@ -192,9 +210,9 @@ class DetectionDataset(Dataset):
             transformed = self.transform(image=image, bboxes=boxes, category_ids=labels)
             image_tensor = transformed["image"]
             boxes, labels = transformed["bboxes"], transformed["category_ids"]
-        except Exception:
-            # Preserve annotations in the fallback instead of turning the image into
-            # an incorrect background-only sample.
+        except ValueError:
+            # Khi augmentation lỗi, vẫn giữ annotation thay vì biến ảnh thành mẫu
+            # nền không chính xác.
             fallback = A.Compose(
                 [A.Resize(self.resolution, self.resolution), A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)), ToTensorV2()],
                 bbox_params=A.BboxParams(format="pascal_voc", label_fields=["category_ids"], min_visibility=0.0),
@@ -204,6 +222,7 @@ class DetectionDataset(Dataset):
             boxes, labels = transformed["bboxes"], transformed["category_ids"]
 
         meta = {
+            # Giữ hộp gốc theo pixel để tính mAP trên validation.
             "image_id": example["id"],
             "width_orig": example["width"],
             "height_orig": example["height"],

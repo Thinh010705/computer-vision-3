@@ -6,51 +6,41 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
 
-from utils.dataset import DetectionDataset
+from utils.dataset import CLASSES, DetectionDataset
 from models.detector import ConvNeXtFPNDetector
 from utils.loss import DetectionLoss
 from utils.nms import decode_predictions, non_maximum_suppression, bbox_iou
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train custom ConvNeXt FPN anchor-free detector.")
-    parser.add_argument("--train_data", required=True, type=str, help="Path to train.json")
-    parser.add_argument("--val_data", required=True, type=str, help="Path to val.json")
-    parser.add_argument("--image_dir", required=True, type=str, help="Path to train images")
-    parser.add_argument("--val_image_dir", required=True, type=str, help="Path to val images")
-    parser.add_argument("--checkpoint_dir", required=True, type=str, help="Directory to save checkpoints")
+    """Đọc đường dẫn dữ liệu và các siêu tham số huấn luyện từ dòng lệnh."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train_data", required=True, type=str)
+    parser.add_argument("--val_data", required=True, type=str)
+    parser.add_argument("--image_dir", required=True, type=str)
+    parser.add_argument("--val_image_dir", required=True, type=str)
+    parser.add_argument("--checkpoint_dir", required=True, type=str)
     
-    # Tham sô huấn luyện và đánh giá
-    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
-    parser.add_argument("--image_size", type=int, default=448, help="Base and final fine-tune image size; must be divisible by 32")
-    parser.add_argument("--multi_scale_sizes", default="416,448,480", help="Comma-separated multi-scale train sizes")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--weight_decay", type=float, default=3e-4, help="Weight decay")
-    parser.add_argument("--backbone_lr_scale", type=float, default=0.05, help="Backbone LR as a fraction of the main LR")
-    parser.add_argument("--class_weight_power", type=float, default=0.5, help="Power applied to inverse class frequencies; 0 disables weights")
-    parser.add_argument("--label_smoothing", type=float, default=0.05, help="Label smoothing for classification loss")
-    parser.add_argument("--multi_scale", action="store_true", default=True, help="Enable multi-scale training")
-    parser.add_argument("--no_multi_scale", action="store_true", help="Disable multi-scale training")
-    parser.add_argument("--conf_threshold", type=float, default=0.05, help="Confidence threshold used during validation mAP")
-    parser.add_argument("--iou_threshold", type=float, default=0.50, help="NMS IoU threshold used during validation mAP")
-    parser.add_argument("--num_workers", type=int, default=2, help="DataLoader workers")
-    parser.add_argument("--resume", type=str, default=None, help="Optional checkpoint for fine-tuning/resume")
-    parser.add_argument("--resume_weights_only", action="store_true", help="Load model weights but restart optimizer and epoch count")
-    parser.add_argument("--no_pretrained", action="store_true", help="Initialize ConvNeXt backbone without ImageNet weights")
-    parser.add_argument("--backbone", choices=["tiny", "small"], default="tiny", help="ConvNeXt backbone size")
-    parser.add_argument("--mosaic_prob", type=float, default=0.15, help="Mosaic probability during the strong augmentation phase")
-    parser.add_argument("--close_mosaic_epochs", type=int, default=5, help="Disable mosaic and strong augmentation for final epochs")
-    parser.add_argument("--fine_tune_lr_scale", type=float, default=0.25, help="Multiply LR when entering final fine-tune phase")
-    parser.add_argument("--fine_tune_only", action="store_true", help="Use light augmentation for every epoch without applying an extra LR reduction")
-    parser.add_argument("--save_top_k", type=int, default=5, help="Keep top-k checkpoints by validation mAP")
-    parser.add_argument("--val_interval", type=int, default=5, help="Validate every N epochs before the dense validation phase")
-    parser.add_argument("--dense_val_epochs", type=int, default=10, help="Validate every epoch during the final N epochs")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("--iou_obj_ratio", type=float, default=0.75, help="Blend ratio from binary to IoU-aware positive objectness target")
-    parser.add_argument("--no_iou_aware_obj", action="store_true", help="Use binary positive objectness targets for baseline comparison")
+    # Các siêu tham số huấn luyện và đánh giá.
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--image_size", type=int, default=448)
+    parser.add_argument("--multi_scale", default="384,416,448,480")
+    parser.add_argument("--lr", type=float, default=7e-4)
+    parser.add_argument("--weight_decay", type=float, default=3e-4)
+    parser.add_argument("--backbone_lr_scale", type=float, default=0.05)
+    parser.add_argument("--class_weight_power", type=float, default=0.5)
+    parser.add_argument("--label_smoothing", type=float, default=0.05)
+    parser.add_argument("--conf_threshold", type=float, default=0.02)
+    parser.add_argument("--iou_threshold", type=float, default=0.55)
+    parser.add_argument("--mosaic_prob", type=float, default=0.15)
+    parser.add_argument("--close_mosaic_epochs", type=int, default=5)
+    parser.add_argument("--fine_tune_lr_scale", type=float, default=0.25)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--iou_obj_ratio", type=float, default=0.75)
     return parser.parse_args()
 
 def set_seed(seed):
+    """Cố định seed cho Python, NumPy và PyTorch để kết quả dễ tái lập."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -59,21 +49,12 @@ def set_seed(seed):
 
 
 def parse_image_sizes(value):
-    sizes = [int(item.strip()) for item in value.split(",") if item.strip()]
-    if not sizes or any(size <= 0 or size % 32 != 0 for size in sizes):
-        raise ValueError("Image sizes must be positive multiples of 32.")
-    return sizes
-
-
-def should_validate(epoch_number, total_epochs, val_interval, dense_val_epochs):
-    if val_interval <= 0:
-        raise ValueError("--val_interval must be greater than 0")
-    dense_start = max(1, total_epochs - max(dense_val_epochs, 0) + 1)
-    return epoch_number % val_interval == 0 or epoch_number >= dense_start or epoch_number == total_epochs
+    """Chuyển chuỗi multi-scale thành danh sách kích thước ảnh."""
+    return [int(item.strip()) for item in value.split(",") if item.strip()]
 
 
 def compute_ap(recalls, precisions):
-    # Tính Average Precision (AP) bằng cách tính diện tích dưới đường cong Precision-Recall.
+    """Tính AP bằng diện tích dưới đường cong Precision-Recall đã nội suy."""
     if not recalls:
         return 0.0
     mrec = [0.0] + recalls + [1.0]
@@ -88,8 +69,10 @@ def compute_ap(recalls, precisions):
 
 def collate_fn(batch):
     """
-    Custom collate function for DataLoader.
-    Prevents PyTorch default_collate from trying to stack variable-size tensors (bboxes/labels) in metadata.
+    Gom các mẫu thành batch mà không stack metadata có số hộp thay đổi.
+
+    Ảnh và target lưới có kích thước cố định nên được stack; metadata chứa
+    hộp/nhãn gốc được giữ dưới dạng danh sách để phục vụ validation.
     """
     images = [item[0] for item in batch]
     target_lists = [item[1] for item in batch]
@@ -101,10 +84,8 @@ def collate_fn(batch):
     return torch.stack(images, 0), targets, metas
 
 
-def evaluate_map(model, val_loader, device, conf_threshold=0.05, iou_threshold=0.5):
-    """
-        Tính mAP@0.5 trên tập validation bằng cách so sánh dự đoán của mô hình với Ground Truth.
-    """
+def evaluate_map(model, val_loader, device, conf_threshold=0.02, iou_threshold=0.55, max_detections=150):
+    """Tính mAP@0.5 bằng cách ghép dự đoán với ground truth theo từng lớp."""
     model.eval()
     
     # Lưu Ground Truth và dự đoán theo lớp để tính toán mAP.
@@ -120,7 +101,7 @@ def evaluate_map(model, val_loader, device, conf_threshold=0.05, iou_threshold=0
         for images, _, metas in val_loader:
             images = images.to(device)
             outputs = model(images)
-            
+
             for b in range(images.shape[0]):
                 img_id = metas[b]['image_id']
                 w_orig = metas[b]['width_orig']
@@ -144,13 +125,17 @@ def evaluate_map(model, val_loader, device, conf_threshold=0.05, iou_threshold=0
                     })
                     gt_counts[cls_name] += 1
                 
-                # Decode all P3/P4/P5 predictions for this image.
+                # Giải mã và gộp toàn bộ dự đoán P3/P4/P5 của ảnh hiện tại.
                 image_outputs = [scale_output[b] for scale_output in outputs]
                 raw_predictions = decode_predictions(image_outputs, w_orig, h_orig, conf_threshold=conf_threshold)
-                # Apply class-wise NMS
-                final_predictions = non_maximum_suppression(raw_predictions, iou_threshold=iou_threshold)
+                # NMS theo lớp loại các hộp trùng trước khi tính AP.
+                final_predictions = sorted(
+                    non_maximum_suppression(raw_predictions, iou_threshold=iou_threshold),
+                    key=lambda prediction: prediction["confidence"],
+                    reverse=True,
+                )[:max_detections]
                 
-                # Group predictions by class
+                # Gom dự đoán theo lớp để xây dựng đường Precision-Recall.
                 for pred in final_predictions:
                     cls_name = pred["class"]
                     pred_boxes_by_class[cls_name].append({
@@ -159,7 +144,7 @@ def evaluate_map(model, val_loader, device, conf_threshold=0.05, iou_threshold=0
                         "bbox": pred["bbox"]
                     })
                     
-    # Calculate AP for each class
+    # Tính AP độc lập cho từng lớp rồi lấy trung bình thành mAP.
     aps = []
     for cls_name in classes:
         num_gt = gt_counts[cls_name]
@@ -195,7 +180,7 @@ def evaluate_map(model, val_loader, device, conf_threshold=0.05, iou_threshold=0
                 tp_flags.append(0)
                 fp_flags.append(1)
                 
-        # Calculate precision-recall curves
+        # Tích lũy TP/FP theo thứ tự confidence để tạo đường Precision-Recall.
         cumulative_tp = []
         cumulative_fp = []
         tp_sum = 0
@@ -216,27 +201,17 @@ def evaluate_map(model, val_loader, device, conf_threshold=0.05, iou_threshold=0
     return mAP
 
 def train(args):
+    """Thực hiện toàn bộ quy trình train, validation và lưu best.pth."""
     set_seed(args.seed)
-    args.multi_scale = args.multi_scale and not args.no_multi_scale
-    scales = parse_image_sizes(args.multi_scale_sizes)
-    if args.image_size <= 0 or args.image_size % 32 != 0:
-        raise ValueError("--image_size must be a positive multiple of 32")
-    if not 0.0 <= args.label_smoothing < 1.0:
-        raise ValueError("--label_smoothing must be in [0, 1)")
-    if args.class_weight_power < 0.0:
-        raise ValueError("--class_weight_power must be non-negative")
-    if not 0.0 < args.backbone_lr_scale <= 1.0:
-        raise ValueError("--backbone_lr_scale must be in (0, 1]")
-    if not 0.0 <= args.iou_obj_ratio <= 1.0:
-        raise ValueError("--iou_obj_ratio must be in [0, 1]")
+    scales = parse_image_sizes(args.multi_scale)
     
-    # 1. Setup Directories
+    # Tạo thư mục lưu checkpoint nếu chưa tồn tại.
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     
-    # 2. Setup Device
+    # Tự động chọn GPU CUDA nếu khả dụng.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    # 3. Create Datasets
+    # Train dùng augmentation; validation chỉ resize và normalize.
     train_dataset = DetectionDataset(args.train_data, args.image_dir, resolution=args.image_size, is_train=True)
     val_dataset = DetectionDataset(args.val_data, args.val_image_dir, resolution=args.image_size, is_train=False)
     train_dataset.base_mosaic_prob = args.mosaic_prob
@@ -244,17 +219,16 @@ def train(args):
     
     print(f"Loaded {len(train_dataset)} training examples and {len(val_dataset)} validation examples.")
     
-    # Dataloaders
+    # collate_fn riêng xử lý metadata có số lượng hộp thay đổi theo ảnh.
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=2,
         pin_memory=True if torch.cuda.is_available() else False,
         collate_fn=collate_fn
     )
     
-    # Validation uses num_workers=2
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
@@ -264,43 +238,27 @@ def train(args):
         collate_fn=collate_fn
     )
     
-    resume_checkpoint = None
-    if args.resume:
-        print(f"Resuming/fine-tuning from: {args.resume}")
-        try:
-            resume_checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
-        except TypeError:
-            resume_checkpoint = torch.load(args.resume, map_location=device)
-        if isinstance(resume_checkpoint, dict):
-            resume_config = resume_checkpoint.get("model_config", {})
-            args.backbone = resume_config.get("backbone", args.backbone)
-    print(
-        "Training configuration: "
-        f"backbone={args.backbone}, image_size={args.image_size}, "
-        f"multi_scale={args.multi_scale}, iou_aware_obj={not args.no_iou_aware_obj}, "
-        f"iou_obj_ratio={args.iou_obj_ratio:.2f}"
-    )
-
-    # 4. Instantiate Model, Loss, Optimizer, and Cosine Scheduler
-    # A resume checkpoint already contains backbone weights, so avoid downloading
-    # ImageNet weights again when starting a resume/fine-tune run.
-    use_pretrained = not args.no_pretrained and resume_checkpoint is None
-    model = ConvNeXtFPNDetector(pretrained=use_pretrained, backbone_name=args.backbone).to(device)
+    # Khởi tạo ConvNeXt-Small pretrained cùng detector và hàm mất mát.
+    model = ConvNeXtFPNDetector(pretrained=True).to(device)
     
-    # Tempered inverse-frequency weights reduce imbalance without overfitting
-    # minority-class details that may not transfer to the hidden test split.
-    class_counts = torch.tensor([5829, 1339, 1028, 833, 1613], dtype=torch.float32, device=device)
+    # Trọng số lớp theo inverse-frequency có làm mềm bằng số mũ, giúp cân bằng
+    # lớp mà không quá ưu tiên các chi tiết hiếm chỉ xuất hiện ở train/validation.
+    class_counts = [0] * len(CLASSES)
+    for example in train_dataset.examples:
+        for label in example["labels"]:
+            class_counts[label] += 1
+    class_counts = torch.tensor(class_counts, dtype=torch.float32, device=device).clamp_min_(1.0)
     class_weights = class_counts.pow(-args.class_weight_power)
     class_weights = class_weights / class_weights.mean()
     
     criterion = DetectionLoss(
         class_weights=class_weights,
         label_smoothing=args.label_smoothing,
-        iou_aware_obj=not args.no_iou_aware_obj,
         iou_obj_ratio=args.iou_obj_ratio,
     ).to(device)
     
-    # Differential Learning Rates: fine-tune backbone 10x slower than the head
+    # Backbone dùng learning rate nhỏ hơn để bảo vệ đặc trưng ImageNet; FPN và
+    # detection head học nhanh hơn để thích nghi với bài toán mới.
     backbone_params = []
     head_params = []
     for name, param in model.named_parameters():
@@ -311,67 +269,48 @@ def train(args):
             
     optimizer = torch.optim.AdamW([
         {"params": backbone_params, "lr": args.lr * args.backbone_lr_scale},
-        {"params": head_params, "lr": args.lr}            # normal learning rate for head parameters
+        {"params": head_params, "lr": args.lr}
     ], weight_decay=args.weight_decay)
 
-    start_epoch = 0
-    resume_best_map = 0.0
-    if resume_checkpoint is not None:
-        if isinstance(resume_checkpoint, dict) and "model_state_dict" in resume_checkpoint:
-            model.load_state_dict(resume_checkpoint["model_state_dict"])
-            if "optimizer_state_dict" in resume_checkpoint and not args.resume_weights_only:
-                optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
-            if not args.resume_weights_only:
-                start_epoch = int(resume_checkpoint.get("epoch", -1)) + 1
-                resume_best_map = float(resume_checkpoint.get("mAP", 0.0))
-        else:
-            model.load_state_dict(resume_checkpoint)
-
-    # Cosine learning rate decay for smooth convergence
+    # CosineAnnealingLR giảm learning rate mượt dần trong toàn bộ quá trình.
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     
-    # Version-safe modern GradScaler for Mixed Precision (AMP)
+    # GradScaler hỗ trợ AMP và tương thích nhiều phiên bản PyTorch.
     try:
         scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
     except (TypeError, ValueError, AttributeError):
         scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
         
-    best_map = resume_best_map
+    best_map = -1.0
     fine_start_epoch = max(0, args.epochs - args.close_mosaic_epochs)
     fine_lr_applied = False
-    top_checkpoints = []
     model_config = {
         "detector": "ConvNeXtFPNDetector",
-        "backbone": args.backbone,
+        "backbone": "small",
         "model_version": getattr(model, "model_version", "unknown"),
         "strides": list(getattr(model, "strides", (8, 16, 32))),
         "image_size": args.image_size,
-        "iou_aware_obj": not args.no_iou_aware_obj,
+        "iou_aware_obj": True,
         "iou_obj_ratio": args.iou_obj_ratio,
-        "fine_tune_only": args.fine_tune_only,
     }
     
-    for epoch in range(start_epoch, args.epochs):
+    for epoch in range(args.epochs):
         model.train()
 
-        fine_phase = args.fine_tune_only or epoch >= fine_start_epoch
+        fine_phase = epoch >= fine_start_epoch
         if fine_phase:
             train_dataset.set_training_stage("fine")
             train_dataset.set_resolution(args.image_size)
-            if not fine_lr_applied and not args.fine_tune_only:
+            if not fine_lr_applied:
                 for group in optimizer.param_groups:
                     group["lr"] *= args.fine_tune_lr_scale
                 fine_lr_applied = True
             print(f"\n--- Epoch {epoch+1}/{args.epochs} | Fine-tune phase: mosaic OFF, light augmentation, {args.image_size}x{args.image_size} ---")
-        elif args.multi_scale and torch.cuda.is_available():
+        else:
             train_dataset.set_training_stage("strong")
             new_res = random.choice(scales)
             train_dataset.set_resolution(new_res)
             print(f"\n--- Epoch {epoch+1}/{args.epochs} | Multi-scale target resolution set to: {new_res}x{new_res} ---")
-        else:
-            train_dataset.set_training_stage("strong")
-            train_dataset.set_resolution(args.image_size)
-            print(f"\n--- Epoch {epoch+1}/{args.epochs} | Target resolution: {args.image_size}x{args.image_size} ---")
             
         epoch_loss = 0.0
         progress_bar = tqdm(train_loader, desc=f"Training Epoch {epoch+1}")
@@ -380,34 +319,35 @@ def train(args):
             images = images.to(device, non_blocking=True)
             targets = [target.to(device, non_blocking=True) for target in targets]
             
-            # Linear Learning Rate Warm-up during first 3 epochs to protect pre-trained weights
+            # Warm-up tuyến tính trong 3 epoch đầu để tránh cập nhật quá mạnh
+            # lên backbone pretrained khi head còn được khởi tạo ngẫu nhiên.
             warmup_epochs = 3
             total_warmup_steps = warmup_epochs * len(train_loader)
             global_step = epoch * len(train_loader) + batch_idx
             if global_step < total_warmup_steps:
                 factor = (global_step + 1) / total_warmup_steps
                 for g_idx, g in enumerate(optimizer.param_groups):
-                    # g_idx 0 is backbone, g_idx 1 is head
+                    # Nhóm 0 là backbone, nhóm 1 là FPN và detection head.
                     base_lr = args.lr * args.backbone_lr_scale if g_idx == 0 else args.lr
                     g['lr'] = base_lr * factor
             
             optimizer.zero_grad(set_to_none=True)
             
-            # Autocast context helper for version safety in PyTorch 2.6+
+            # Autocast chọn kiểu dữ liệu phù hợp để tăng tốc và giảm VRAM.
             try:
                 autocast_context = torch.amp.autocast('cuda', enabled=torch.cuda.is_available())
             except (TypeError, ValueError, AttributeError):
                 autocast_context = torch.cuda.amp.autocast(enabled=torch.cuda.is_available())
                 
-            # Forward pass under Mixed Precision autocast
+            # Forward và tính loss dưới chế độ mixed precision.
             with autocast_context:
                 outputs = model(images)
                 loss = criterion(outputs, targets)
                 
-            # Backward and Optimizer step using GradScaler with Gradient Norm Clipping
+            # GradScaler tránh underflow khi backward với số thực FP16.
             scaler.scale(loss).backward()
             
-            # Unscale gradients before clipping
+            # Phải unscale trước khi clip norm để giới hạn gradient chính xác.
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             
@@ -421,65 +361,29 @@ def train(args):
         avg_train_loss = epoch_loss / len(train_loader)
         
         epoch_number = epoch + 1
-        run_validation = should_validate(epoch_number, args.epochs, args.val_interval, args.dense_val_epochs)
+        # Validation sau mọi epoch và chỉ giữ checkpoint có mAP tốt nhất.
+        print("Calculating Validation mAP@0.5...")
+        val_map = evaluate_map(
+            model,
+            val_loader,
+            device,
+            conf_threshold=args.conf_threshold,
+            iou_threshold=args.iou_threshold,
+        )
+        print(f"Epoch {epoch_number} Summary: Avg Train Loss = {avg_train_loss:.4f} | Val mAP@0.5 = {val_map:.4f}")
 
-        # 6. Evaluation and ranked checkpoint saving only on scheduled epochs.
-        if run_validation:
-            print("Calculating Validation mAP@0.5...")
-            val_map = evaluate_map(
-                model,
-                val_loader,
-                device,
-                conf_threshold=args.conf_threshold,
-                iou_threshold=args.iou_threshold,
-            )
-            print(f"Epoch {epoch_number} Summary: Avg Train Loss = {avg_train_loss:.4f} | Val mAP@0.5 = {val_map:.4f}")
-
-            if val_map > best_map:
-                best_map = val_map
-                best_path = os.path.join(args.checkpoint_dir, "best.pth")
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'mAP': val_map,
-                    'conf_threshold': args.conf_threshold,
-                    'iou_threshold': args.iou_threshold,
-                    'model_config': model_config,
-                }, best_path)
-                print(f"⭐ New Best Model saved with mAP@0.5 = {val_map:.4f} at {best_path}")
-
-            top_path = os.path.join(args.checkpoint_dir, f"epoch_{epoch_number:03d}_map_{val_map:.4f}.pth")
+        if val_map > best_map:
+            best_map = val_map
+            best_path = os.path.join(args.checkpoint_dir, "best.pth")
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
                 'mAP': val_map,
+                'conf_threshold': args.conf_threshold,
+                'iou_threshold': args.iou_threshold,
                 'model_config': model_config,
-            }, top_path)
-            top_checkpoints.append((val_map, top_path))
-            top_checkpoints.sort(key=lambda item: item[0], reverse=True)
-            while len(top_checkpoints) > args.save_top_k:
-                _, remove_path = top_checkpoints.pop()
-                if os.path.exists(remove_path):
-                    os.remove(remove_path)
-        else:
-            print(
-                f"Epoch {epoch_number} Summary: Avg Train Loss = {avg_train_loss:.4f} | "
-                f"Validation skipped | Best mAP@0.5 = {best_map:.4f}"
-            )
-            
-        # Always save latest so training can resume even when validation is skipped.
-        latest_path = os.path.join(args.checkpoint_dir, "latest.pth")
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'mAP': best_map,
-            'conf_threshold': args.conf_threshold,
-            'iou_threshold': args.iou_threshold,
-            'model_config': model_config,
-        }, latest_path)
+            }, best_path)
+            print(f"New best Model saved with mAP@0.5 = {val_map:.4f} at {best_path}")
 
     print(f"\nTraining completed! Best Validation mAP@0.5 = {best_map:.4f}")
 

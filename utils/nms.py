@@ -1,10 +1,10 @@
 import torch
-import numpy as np
 
 def bbox_iou(box_a, box_b):
     """
-    Compute IoU between two bounding boxes [xmin, ymin, xmax, ymax].
-    Used during NMS post-processing.
+    Tính IoU giữa hai hộp ``[xmin, ymin, xmax, ymax]``.
+
+    Hàm được dùng khi NMS và khi đánh giá dự đoán với ground truth.
     """
     ax1, ay1, ax2, ay2 = box_a
     bx1, by1, bx2, by2 = box_b
@@ -28,10 +28,10 @@ def bbox_iou(box_a, box_b):
 
 def decode_predictions(prediction, img_width, img_height, conf_threshold=0.15):
     """
-    Decode raw network grid output tensor into bounding boxes in original image resolution.
-    prediction: tensor of shape (10, S, S)
-    img_width, img_height: original image size
-    conf_threshold: confidence threshold for filtering
+    Giải mã tensor lưới thô thành hộp bao theo kích thước ảnh gốc.
+
+    prediction có dạng ``(10, S, S)``. Confidence cuối được tính bằng
+    objectness nhân xác suất lớp lớn nhất, sau đó lọc theo conf_threshold.
     """
     if isinstance(prediction, (list, tuple)):
         decoded = []
@@ -42,21 +42,20 @@ def decode_predictions(prediction, img_width, img_height, conf_threshold=0.15):
     S = prediction.shape[1]
     classes = ["person", "car", "dog", "cat", "chair"]
     
-    # Apply activations to logits
-    # Channel 0: objectness (sigmoid)
+    # Kênh 0 là objectness, được đưa qua sigmoid.
     pred_obj = torch.sigmoid(prediction[0, :, :]) # (S, S)
-    # Channels 1-5: class scores (softmax)
+    # Kênh 1-5 là logits lớp, được chuẩn hóa bằng softmax.
     pred_class_probs = torch.softmax(prediction[1:6, :, :], dim=0) # (5, S, S)
-    # Channels 6-9: coordinates (sigmoid offsets and sizes)
+    # Kênh 6-9 là offset tâm và kích thước hộp, được giới hạn bằng sigmoid.
     pred_coords = torch.sigmoid(prediction[6:10, :, :]) # (4, S, S)
     
-    # For each cell, find the class with the maximum probability (argmax)
+    # Mỗi ô chỉ giữ lớp có xác suất lớn nhất.
     max_class_probs, max_class_indices = torch.max(pred_class_probs, dim=0) # (S, S)
     
-    # Combined scores for the best class in each cell
+    # Confidence kết hợp chất lượng objectness và xác suất phân lớp.
     scores = pred_obj * max_class_probs # (S, S)
     
-    # Find grid locations exceeding threshold
+    # Chỉ giải mã các ô có confidence vượt ngưỡng.
     rows, cols = torch.where(scores >= conf_threshold)
     
     decoded_boxes = []
@@ -68,7 +67,7 @@ def decode_predictions(prediction, img_width, img_height, conf_threshold=0.15):
         score = scores[row, col].item()
         class_name = classes[c_idx]
         
-        # Decode center x, y and width, height relative to cell and image
+        # Giải mã tâm theo ô lưới; width/height tương đối theo toàn ảnh.
         tx = pred_coords[0, row, col].item()
         ty = pred_coords[1, row, col].item()
         tw = pred_coords[2, row, col].item()
@@ -79,38 +78,39 @@ def decode_predictions(prediction, img_width, img_height, conf_threshold=0.15):
         w = tw
         h = th
         
-        # Convert to corner bounding boxes [xmin, ymin, xmax, ymax]
+        # Đổi sang định dạng góc [xmin, ymin, xmax, ymax].
         xmin = (xc - w / 2.0) * img_width
         ymin = (yc - h / 2.0) * img_height
         xmax = (xc + w / 2.0) * img_width
         ymax = (yc + h / 2.0) * img_height
         
-        # Clip bounding box to fit inside original image boundaries
+        # Giới hạn hộp trong biên ảnh gốc.
         xmin = max(0.0, min(float(img_width), xmin))
         ymin = max(0.0, min(float(img_height), ymin))
         xmax = max(0.0, min(float(img_width), xmax))
         ymax = max(0.0, min(float(img_height), ymax))
         
-        # Require a valid area bounding box
+        # Chỉ giữ hộp có diện tích hợp lệ.
         if xmax > xmin and ymax > ymin:
             decoded_boxes.append({
                 "class": class_name,
-                "confidence": round(score, 4),
-                "bbox": [round(xmin, 1), round(ymin, 1), round(xmax, 1), round(ymax, 1)]
+                "confidence": score,
+                "bbox": [xmin, ymin, xmax, ymax]
             })
             
     return decoded_boxes
 
 def non_maximum_suppression(boxes, iou_threshold=0.5):
     """
-    Perform class-wise Non-Maximum Suppression (NMS) to eliminate overlapping redundant boxes.
-    boxes: list of dicts: [{"class": str, "confidence": float, "bbox": [4 values]}]
-    iou_threshold: threshold above which overlapping boxes are suppressed
+    Thực hiện NMS riêng theo từng lớp để loại các hộp trùng lặp.
+
+    Hộp có confidence cao nhất được giữ trước; các hộp cùng lớp có IoU vượt
+    ngưỡng với hộp đã giữ sẽ bị loại.
     """
     if not boxes:
         return []
         
-    # Group boxes by their predicted class
+    # Gom hộp theo lớp để các lớp khác nhau không triệt tiêu lẫn nhau.
     boxes_by_class = {}
     for box in boxes:
         cls = box["class"]
@@ -120,16 +120,16 @@ def non_maximum_suppression(boxes, iou_threshold=0.5):
         
     keep_boxes = []
     
-    # Apply NMS for each class independently
+    # Áp dụng NMS độc lập cho từng lớp.
     for cls, class_boxes in boxes_by_class.items():
-        # Sort boxes descending by confidence score
+        # Sắp xếp giảm dần theo confidence để ưu tiên hộp tốt nhất.
         sorted_boxes = sorted(class_boxes, key=lambda b: b["confidence"], reverse=True)
         
         while sorted_boxes:
             best_box = sorted_boxes.pop(0)
             keep_boxes.append(best_box)
             
-            # Keep only boxes that do not overlap significantly with the best box
+            # Loại các hộp chồng lắp quá nhiều với hộp vừa được giữ.
             sorted_boxes = [
                 box for box in sorted_boxes
                 if bbox_iou(best_box["bbox"], box["bbox"]) < iou_threshold

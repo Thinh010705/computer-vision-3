@@ -19,19 +19,20 @@ DEFAULT_WEIGHT_URL = (
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run inference and generate object detection predictions.")
-    parser.add_argument("--image_dir", required=True, type=str, help="Directory containing images to predict")
-    parser.add_argument("--output", required=True, type=str, help="Path to save predictions predictions.json")
-    parser.add_argument("--checkpoint", nargs="+", default=[DEFAULT_CHECKPOINT], help="One or more checkpoint paths")
-    parser.add_argument("--conf_threshold", type=float, default=0.05, help="Confidence threshold")
-    parser.add_argument("--iou_threshold", type=float, default=0.50, help="IoU threshold for NMS")
-    parser.add_argument("--tta_flip", action="store_true", help="Run horizontal flip test-time augmentation")
-    parser.add_argument("--tta_sizes", default="448", help="Comma-separated inference sizes, e.g. 416,448,480")
-    parser.add_argument("--max_detections", type=int, default=100, help="Maximum detections per image")
+    """Đọc các đường dẫn và cấu hình hậu xử lý từ dòng lệnh."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--image_dir", required=True, type=str)
+    parser.add_argument("--output", required=True, type=str)
+    parser.add_argument("--checkpoint", nargs="+", default=[DEFAULT_CHECKPOINT])
+    parser.add_argument("--conf_threshold", type=float, default=0.02)
+    parser.add_argument("--iou_threshold", type=float, default=0.55)
+    parser.add_argument("--tta_sizes", default="448")
+    parser.add_argument("--max_detections", type=int, default=150)
     return parser.parse_args()
 
 
 def ensure_default_checkpoint(path):
+    """Tự tải checkpoint mặc định từ Hugging Face nếu file chưa tồn tại."""
     if os.path.exists(path):
         return
 
@@ -42,6 +43,7 @@ def ensure_default_checkpoint(path):
     if checkpoint_dir:
         os.makedirs(checkpoint_dir, exist_ok=True)
 
+    # Tải vào file tạm để không sử dụng nhầm checkpoint chưa hoàn tất.
     temporary_path = f"{path}.download"
     print(f"Checkpoint not found at '{path}'.")
     print(f"Downloading default checkpoint from Hugging Face to: {path}")
@@ -58,6 +60,7 @@ def ensure_default_checkpoint(path):
 
 
 def load_checkpoint_state(path, device):
+    """Đọc trọng số và metadata mô hình từ checkpoint."""
     ensure_default_checkpoint(path)
 
     print(f"Loading checkpoint from: {path}")
@@ -72,10 +75,11 @@ def load_checkpoint_state(path, device):
 
 
 def load_models(checkpoint_paths, device):
+    """Khởi tạo các mô hình Small phục vụ suy luận hoặc ensemble."""
     models = []
     for checkpoint_path in checkpoint_paths:
-        state_dict, model_config = load_checkpoint_state(checkpoint_path, device)
-        model = ConvNeXtFPNDetector(pretrained=False, backbone_name=model_config.get("backbone", "tiny"))
+        state_dict, _ = load_checkpoint_state(checkpoint_path, device)
+        model = ConvNeXtFPNDetector(pretrained=False)
         model.load_state_dict(state_dict)
         model = model.to(device)
         model.eval()
@@ -84,14 +88,15 @@ def load_models(checkpoint_paths, device):
 
 
 def flip_boxes_back(boxes, img_width):
+    """Đưa hộp dự đoán từ ảnh lật ngang về hệ tọa độ ảnh gốc."""
     flipped = []
     for box in boxes:
         xmin, ymin, xmax, ymax = box["bbox"]
         new_box = dict(box)
         new_box["bbox"] = [
-            round(max(0.0, img_width - xmax), 1),
+            max(0.0, img_width - xmax),
             ymin,
-            round(min(float(img_width), img_width - xmin), 1),
+            min(float(img_width), img_width - xmin),
             ymax,
         ]
         flipped.append(new_box)
@@ -99,101 +104,100 @@ def flip_boxes_back(boxes, img_width):
 
 
 def limit_detections(boxes, max_detections):
+    """Giữ tối đa số hộp yêu cầu, ưu tiên confidence cao nhất."""
     return sorted(boxes, key=lambda b: b["confidence"], reverse=True)[:max_detections]
 
 
 def parse_sizes(value):
-    sizes = [int(item.strip()) for item in value.split(",") if item.strip()]
-    if not sizes or any(size <= 0 or size % 32 != 0 for size in sizes):
-        raise ValueError("TTA sizes must be positive multiples of 32.")
-    return sizes
+    """Chuyển chuỗi kích thước TTA thành danh sách số nguyên."""
+    return [int(item.strip()) for item in value.split(",") if item.strip()]
 
 
 def prepare_image(img, size, normalize, device):
+    """Resize, chuyển ảnh thành tensor, chuẩn hóa ImageNet và đưa lên device."""
     resized = img.resize((size, size), Image.BILINEAR)
     return normalize(TF.to_tensor(resized)).unsqueeze(0).to(device)
 
 
 @torch.no_grad()
-def predict_image_boxes(models, img, conf_threshold, tta_flip, tta_sizes, normalize, device):
+def predict_image_boxes(models, img, conf_threshold, tta_sizes, normalize, device):
+    """Thu thập hộp thô từ nhiều model, kích thước TTA và ảnh lật ngang."""
     w_orig, h_orig = img.size
     raw_boxes = []
     for size in tta_sizes:
         img_tensor = prepare_image(img, size, normalize, device)
         for model in models:
             output = model(img_tensor)
-            flipped_output = model(torch.flip(img_tensor, dims=[3])) if tta_flip else None
+            # TTA lật ngang luôn bật để bổ sung các dự đoán ổn định hơn.
+            flipped_output = model(torch.flip(img_tensor, dims=[3]))
 
             image_outputs = [scale_output[0] for scale_output in output]
             raw_boxes.extend(decode_predictions(image_outputs, w_orig, h_orig, conf_threshold=conf_threshold))
-            if flipped_output is not None:
-                flipped_image_outputs = [scale_output[0] for scale_output in flipped_output]
-                flipped_boxes = decode_predictions(flipped_image_outputs, w_orig, h_orig, conf_threshold=conf_threshold)
-                raw_boxes.extend(flip_boxes_back(flipped_boxes, w_orig))
+            flipped_image_outputs = [scale_output[0] for scale_output in flipped_output]
+            flipped_boxes = decode_predictions(flipped_image_outputs, w_orig, h_orig, conf_threshold=conf_threshold)
+            raw_boxes.extend(flip_boxes_back(flipped_boxes, w_orig))
     return raw_boxes
 
 
 def main():
+    """Chạy suy luận toàn bộ thư mục ảnh và ghi file predictions.json."""
     args = parse_args()
     
-    # 1. Setup Device
+    # Chọn GPU nếu khả dụng, nếu không sẽ suy luận bằng CPU.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # 2. Instantiate and Load Model(s). Multiple checkpoints are ensembled by box merging + NMS.
+    # Nhiều checkpoint được ensemble bằng cách gộp hộp thô rồi áp dụng NMS.
     models = load_models(args.checkpoint, device)
     tta_sizes = parse_sizes(args.tta_sizes)
     
-    # Image Net normalization transforms
+    # Chuẩn hóa theo thống kê ImageNet tương ứng với backbone pretrained.
     normalize = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     
-    # 3. Locate Images
+    # Thu thập tất cả file ảnh hợp lệ trong thư mục đầu vào.
     valid_exts = ('.jpg', '.jpeg', '.png', '.bmp')
-    img_files = [f for f in os.listdir(args.image_dir) if f.lower().endswith(valid_exts)]
+    img_files = sorted(f for f in os.listdir(args.image_dir) if f.lower().endswith(valid_exts))
     print(f"Found {len(img_files)} images in '{args.image_dir}' for prediction.")
     
     predictions_json = []
     
-    # 4. Inference loop
+    # Suy luận lần lượt từng ảnh để giữ mức sử dụng bộ nhớ ổn định.
     with torch.no_grad():
         for filename in tqdm(img_files, desc="Inferring"):
             img_path = os.path.join(args.image_dir, filename)
             
             try:
                 img = Image.open(img_path).convert("RGB")
-                w_orig, h_orig = img.size
-                
                 raw_boxes = predict_image_boxes(
                     models,
                     img,
                     args.conf_threshold,
-                    args.tta_flip,
                     tta_sizes,
                     normalize,
                     device,
                 )
                 
-                # Apply class-wise NMS.
+                # Áp dụng NMS theo lớp rồi giới hạn số lượng hộp mỗi ảnh.
                 final_boxes = limit_detections(non_maximum_suppression(
                     raw_boxes, 
                     iou_threshold=args.iou_threshold,
                 ), args.max_detections)
                 
-                # Append result
+                # Luôn xuất đúng cấu trúc JSON yêu cầu của đề bài.
                 predictions_json.append({
                     "image_id": filename,
                     "boxes": final_boxes
                 })
                 
-            except Exception as e:
-                print(f"Error predicting image {filename}: {e}")
-                # Ensure the entry is still generated even if failed (empty list)
+            except OSError as error:
+                print(f"Không thể đọc ảnh {filename}: {error}")
+                # Nếu một ảnh lỗi, vẫn xuất image_id với danh sách hộp rỗng.
                 predictions_json.append({
                     "image_id": filename,
                     "boxes": []
                 })
                 
-    # 5. Save output predictions JSON
+    # Ghi toàn bộ kết quả suy luận thành predictions.json.
     with open(args.output, 'w', encoding='utf-8') as f:
         json.dump(predictions_json, f, indent=2, ensure_ascii=False)
         

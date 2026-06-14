@@ -1,1 +1,1 @@
-"""Data, loss, decoding, and NMS utilities."""
+"""Các tiện ích xử lý dữ liệu, hàm mất mát, giải mã hộp và NMS."""

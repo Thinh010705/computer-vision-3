@@ -1,6 +1,6 @@
 # Mô hình Phát hiện Đối tượng Anchor-Free Đa Tỉ lệ với ConvNeXt và FPN P3/P4/P5
 
-Kiến trúc sử dụng backbone **ConvNeXt-Tiny** hoặc **ConvNeXt-Small** pretrained ImageNet kết hợp FPN và các detection head tự cài đặt. Mô hình tạo ba lưới dự đoán tại stride `8`, `16` và `32`. Với ảnh đầu vào `448 x 448`, các lưới tương ứng có kích thước:
+Kiến trúc sử dụng duy nhất backbone **ConvNeXt-Small pretrained ImageNet** kết hợp FPN và các detection head tự cài đặt. Mô hình tạo ba lưới dự đoán tại stride `8`, `16` và `32`. Với ảnh đầu vào `448 x 448`, các lưới tương ứng có kích thước:
 
 ```text
 P3: 56 x 56 - ưu tiên vật thể nhỏ
@@ -22,9 +22,8 @@ Toàn bộ pipeline phát hiện đối tượng phía sau backbone được t�
 │   ├── dataset.py                # Đọc JSON/ảnh, augmentation, Mosaic và tạo target đa tỉ lệ
 │   ├── loss.py                   # Focal Loss, Weighted CE, CIoU và Smooth L1 tự cài đặt
 │   └── nms.py                    # Decode, IoU và Class-wise NMS tự cài đặt
-├── train.py                      # Huấn luyện, validation mAP, AMP và lưu top-k checkpoint
+├── train.py                      # Huấn luyện, validation mAP, AMP và lưu best.pth
 ├── predict.py                    # Suy luận ảnh, TTA/ensemble và xuất predictions.json
-├── tune_thresholds.py            # Quét confidence/NMS threshold tốt nhất trên validation
 ├── README.md                     # Hướng dẫn cài đặt, huấn luyện, suy luận và đánh giá
 └── requirements.txt              # Danh sách thư viện Python cần cài đặt
 ```
@@ -50,41 +49,8 @@ python train.py \
   --checkpoint_dir ./models/
 ```
 
-### Bước 3: Tune Confidence và NMS Threshold
+### Bước 3: Chạy Suy luận
 
-Sau khi train xong, chạy `tune_thresholds.py` trên validation để tìm confidence threshold và NMS IoU threshold tốt nhất:
-
-```bash
-python tune_thresholds.py \
-  --val_data ./public/annotations/val.json \
-  --val_image_dir ./public/val/images \
-  --checkpoint ./models/best.pth \
-  --tta_flip
-```
-
-Script sẽ in dòng kết quả cuối dạng:
-
-```text
-BEST conf=0.03 iou=0.45 mAP@0.5=...
-```
-
-Sử dụng đúng hai giá trị `conf` và `iou` này khi chạy `predict.py`. Nếu tune có `--tta_flip`, suy luận cuối cũng phải bật `--tta_flip`.
-
-Có thể thử multi-scale TTA:
-
-```bash
-python tune_thresholds.py \
-  --val_data ./public/annotations/val.json \
-  --val_image_dir ./public/val/images \
-  --checkpoint ./models_p3p5_tiny/best.pth \
-  --tta_sizes 416,448,480 \
-  --tta_flip
-```
-
-Multi-scale TTA chậm hơn đáng kể và chỉ nên sử dụng nếu evaluator chính thức cho kết quả cao hơn.
-
-### Bước 4: Chạy Suy luận
-Không có threshold:
 ```bash
 python predict.py \
   --image_dir ./public/val/images \
@@ -105,18 +71,11 @@ Repository Hugging Face cần được giữ ở chế độ public và môi tr�
 có kết nối mạng. Checkpoint được tải vào file tạm `./models/best.pth.download`
 rồi mới đổi tên thành `./models/best.pth`, tránh sử dụng file tải chưa hoàn tất.
 
-Với threshold
-```bash
-python predict.py \
-  --image_dir ./public/val/images \
-  --output predictions.json \
-  --checkpoint ./models/best.pth \
-  --conf_threshold <BEST_CONF_SMALL> \
-  --iou_threshold <BEST_IOU_SMALL> \
-  --tta_flip
-```
+Khi không truyền cấu hình hậu xử lý, chương trình tự dùng các giá trị mặc định
+đã chọn trước: confidence threshold `0.02`, NMS IoU threshold `0.55`, kích
+thước TTA `448`, TTA lật ngang luôn bật và tối đa `150` hộp trên mỗi ảnh.
 
-### Bước 5: Tự chấm điểm và Đánh giá mAP@0.5
+### Bước 4: Tự chấm điểm và Đánh giá mAP@0.5
 
 Sau khi tạo `predictions.json`, chạy evaluator chính thức:
 
@@ -133,3 +92,90 @@ python tools/evaluate_predictions.py \
   --predictions predictions.json \
   --output score.json
 ```
+
+---
+
+## Chạy và Chấm bằng Docker
+
+Các lệnh dưới đây cần được chạy lần lượt từ thư mục gốc của dự án, nơi chứa
+`Dockerfile`, `predict.py`, `models/` và `public/`.
+
+### Bước 1: Di chuyển vào thư mục dự án
+
+```bash
+cd /Users/nguyennangthinh/Downloads/computer-vision
+ls Dockerfile predict.py public/val/images
+```
+
+### Bước 2: Build Docker image
+
+Trên máy Linux x86_64 hoặc máy chấm của giảng viên:
+
+```bash
+docker build -t object-detection-exam:2026 .
+```
+
+Trên Mac Apple Silicon, có thể build image tương thích Linux AMD64:
+
+```bash
+docker buildx build \
+  --platform linux/amd64 \
+  --load \
+  -t object-detection-exam:2026 .
+```
+
+Kiểm tra image đã được tạo:
+
+```bash
+docker images object-detection-exam:2026
+```
+
+### Bước 3: Tạo thư mục chứa kết quả chấm
+
+```bash
+mkdir -p grading_outputs
+```
+
+### Bước 4: Chạy inference bằng Docker
+
+```bash
+docker run --rm --gpus all \
+  -w /workspace \
+  -v "$PWD/public/val/images:/exam/val_images:ro" \
+  -v "$PWD:/workspace" \
+  -v "$PWD/grading_outputs:/exam/outputs" \
+  object-detection-exam:2026 \
+  python predict.py \
+    --image_dir /exam/val_images \
+    --output /exam/outputs/val_predictions.json
+```
+
+Nếu `./models/best.pth` chưa tồn tại, `predict.py` tự tải weight từ Hugging
+Face về thư mục `models/`. Do dự án được mount vào `/workspace`, file weight
+đã tải vẫn được giữ trên máy sau khi container kết thúc.
+
+### Bước 5: Kiểm tra file predictions
+
+```bash
+ls -lh grading_outputs/val_predictions.json
+```
+
+### Bước 6: Chấm mAP trên validation
+
+Chạy evaluator bên ngoài Docker:
+
+```bash
+python public/tools/evaluate_predictions.py \
+  --ground_truth public/annotations/val.json \
+  --predictions grading_outputs/val_predictions.json \
+  --output grading_outputs/val_score.json
+```
+
+Xem kết quả:
+
+```bash
+cat grading_outputs/val_score.json
+```
+
+Khi giảng viên chạy lệnh inference tối giản, `predict.py` tự sử dụng toàn bộ
+cấu hình hậu xử lý mặc định được khai báo trong script.
