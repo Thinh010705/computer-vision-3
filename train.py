@@ -35,6 +35,8 @@ def parse_args():
     parser.add_argument("--mosaic_prob", type=float, default=0.15)
     parser.add_argument("--close_mosaic_epochs", type=int, default=5)
     parser.add_argument("--fine_tune_lr_scale", type=float, default=0.25)
+    parser.add_argument("--val_interval", type=int, default=5)
+    parser.add_argument("--dense_val_epochs", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--iou_obj_ratio", type=float, default=0.75)
     return parser.parse_args()
@@ -283,6 +285,8 @@ def train(args):
         
     best_map = -1.0
     fine_start_epoch = max(0, args.epochs - args.close_mosaic_epochs)
+    validation_interval = max(1, args.val_interval)
+    dense_val_epochs = max(0, args.dense_val_epochs)
     fine_lr_applied = False
     model_config = {
         "detector": "ConvNeXtFPNDetector",
@@ -361,29 +365,35 @@ def train(args):
         avg_train_loss = epoch_loss / len(train_loader)
         
         epoch_number = epoch + 1
-        # Validation sau mọi epoch và chỉ giữ checkpoint có mAP tốt nhất.
-        print("Calculating Validation mAP@0.5...")
-        val_map = evaluate_map(
-            model,
-            val_loader,
-            device,
-            conf_threshold=args.conf_threshold,
-            iou_threshold=args.iou_threshold,
-        )
-        print(f"Epoch {epoch_number} Summary: Avg Train Loss = {avg_train_loss:.4f} | Val mAP@0.5 = {val_map:.4f}")
+        # Validation thưa ở đầu quá trình và dày ở các epoch cuối để giảm thời gian.
+        dense_validation = epoch_number > args.epochs - dense_val_epochs
+        should_validate = epoch_number % validation_interval == 0 or dense_validation or epoch_number == args.epochs
 
-        if val_map > best_map:
-            best_map = val_map
-            best_path = os.path.join(args.checkpoint_dir, "best.pth")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'mAP': val_map,
-                'conf_threshold': args.conf_threshold,
-                'iou_threshold': args.iou_threshold,
-                'model_config': model_config,
-            }, best_path)
-            print(f"New best Model saved with mAP@0.5 = {val_map:.4f} at {best_path}")
+        if should_validate:
+            print("Calculating Validation mAP@0.5...")
+            val_map = evaluate_map(
+                model,
+                val_loader,
+                device,
+                conf_threshold=args.conf_threshold,
+                iou_threshold=args.iou_threshold,
+            )
+            print(f"Epoch {epoch_number} Summary: Avg Train Loss = {avg_train_loss:.4f} | Val mAP@0.5 = {val_map:.4f}")
+
+            if val_map > best_map:
+                best_map = val_map
+                best_path = os.path.join(args.checkpoint_dir, "best.pth")
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'mAP': val_map,
+                    'conf_threshold': args.conf_threshold,
+                    'iou_threshold': args.iou_threshold,
+                    'model_config': model_config,
+                }, best_path)
+                print(f"New best Model saved with mAP@0.5 = {val_map:.4f} at {best_path}")
+        else:
+            print(f"Epoch {epoch_number} Summary: Avg Train Loss = {avg_train_loss:.4f} | Validation skipped")
 
     print(f"\nTraining completed! Best Validation mAP@0.5 = {best_map:.4f}")
 

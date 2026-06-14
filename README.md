@@ -49,6 +49,10 @@ python train.py \
   --checkpoint_dir ./models/
 ```
 
+Mặc định, chương trình tính mAP mỗi `5` epoch và tính ở từng epoch trong
+`10` epoch cuối. Có thể thay đổi lịch validation bằng `--val_interval` và
+`--dense_val_epochs`.
+
 ### Bước 3: Chạy Suy luận
 
 ```bash
