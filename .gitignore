@@ -1,5 +1,26 @@
+# Dataset
+public/
+
+# Model weights
+models/*.pth
+models/*.pt
+models/*.ckpt
+models/*.download
+
+# Prediction and evaluation outputs
+predictions*.json
+*_predictions.json
+*_score.json
+grading_outputs/
+
+# Python
 cv/
+venv/
+.venv/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# macOS
+.DS_Store

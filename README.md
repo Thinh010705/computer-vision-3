@@ -25,7 +25,6 @@ Toàn bộ pipeline phát hiện đối tượng phía sau backbone được t�
 ├── train.py                      # Huấn luyện, validation mAP, AMP và lưu top-k checkpoint
 ├── predict.py                    # Suy luận ảnh, TTA/ensemble và xuất predictions.json
 ├── tune_thresholds.py            # Quét confidence/NMS threshold tốt nhất trên validation
-├── average_checkpoints.py        # Tạo model soup bằng trung bình trọng số checkpoint
 ├── README.md                     # Hướng dẫn cài đặt, huấn luyện, suy luận và đánh giá
 └── requirements.txt              # Danh sách thư viện Python cần cài đặt
 ```
@@ -93,6 +92,19 @@ python predict.py \
   --checkpoint ./models/best.pth
 
 ```
+
+Nếu không truyền `--checkpoint`, chương trình mặc định sử dụng
+`./models/best.pth`. Khi file này chưa tồn tại, `predict.py` tự động tải
+checkpoint từ Hugging Face:
+
+```text
+https://huggingface.co/NangThinh/Object_Detection_ConvNeXt_Small/resolve/main/best.pth
+```
+
+Repository Hugging Face cần được giữ ở chế độ public và môi trường chấm cần
+có kết nối mạng. Checkpoint được tải vào file tạm `./models/best.pth.download`
+rồi mới đổi tên thành `./models/best.pth`, tránh sử dụng file tải chưa hoàn tất.
+
 Với threshold
 ```bash
 python predict.py \

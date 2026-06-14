@@ -1,6 +1,7 @@
 import os
 import argparse
 import json
+import urllib.request
 import torch
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
@@ -10,11 +11,18 @@ from tqdm import tqdm
 from models.detector import ConvNeXtFPNDetector
 from utils.nms import decode_predictions, non_maximum_suppression
 
+DEFAULT_CHECKPOINT = "./models/best.pth"
+DEFAULT_WEIGHT_URL = (
+    "https://huggingface.co/NangThinh/Object_Detection_ConvNeXt_Small/"
+    "resolve/main/best.pth"
+)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Run inference and generate object detection predictions.")
     parser.add_argument("--image_dir", required=True, type=str, help="Directory containing images to predict")
     parser.add_argument("--output", required=True, type=str, help="Path to save predictions predictions.json")
-    parser.add_argument("--checkpoint", nargs="+", default=["./models/best.pth"], help="One or more checkpoint paths")
+    parser.add_argument("--checkpoint", nargs="+", default=[DEFAULT_CHECKPOINT], help="One or more checkpoint paths")
     parser.add_argument("--conf_threshold", type=float, default=0.05, help="Confidence threshold")
     parser.add_argument("--iou_threshold", type=float, default=0.50, help="IoU threshold for NMS")
     parser.add_argument("--tta_flip", action="store_true", help="Run horizontal flip test-time augmentation")
@@ -23,9 +31,34 @@ def parse_args():
     return parser.parse_args()
 
 
+def ensure_default_checkpoint(path):
+    if os.path.exists(path):
+        return
+
+    if os.path.normpath(path) != os.path.normpath(DEFAULT_CHECKPOINT):
+        raise FileNotFoundError(f"Checkpoint not found at '{path}'.")
+
+    checkpoint_dir = os.path.dirname(path)
+    if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+    temporary_path = f"{path}.download"
+    print(f"Checkpoint not found at '{path}'.")
+    print(f"Downloading default checkpoint from Hugging Face to: {path}")
+    try:
+        urllib.request.urlretrieve(DEFAULT_WEIGHT_URL, temporary_path)
+        os.replace(temporary_path, path)
+    except Exception as error:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+        raise RuntimeError(
+            f"Failed to download checkpoint from '{DEFAULT_WEIGHT_URL}': {error}"
+        ) from error
+    print("Checkpoint download completed.")
+
+
 def load_checkpoint_state(path, device):
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Checkpoint not found at '{path}'. Make sure you train the model first.")
+    ensure_default_checkpoint(path)
 
     print(f"Loading checkpoint from: {path}")
     try:
