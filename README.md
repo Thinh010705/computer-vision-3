@@ -49,10 +49,6 @@ python train.py \
   --checkpoint_dir ./models/
 ```
 
-Mặc định, chương trình tính mAP mỗi `5` epoch và tính ở từng epoch trong
-`10` epoch cuối. Có thể thay đổi lịch validation bằng `--val_interval` và
-`--dense_val_epochs`.
-
 ### Bước 3: Chạy Suy luận
 
 ```bash
@@ -70,14 +66,6 @@ checkpoint từ Hugging Face:
 ```text
 https://huggingface.co/NangThinh/Object_Detection_ConvNeXt_Small/resolve/main/best.pth
 ```
-
-Repository Hugging Face cần được giữ ở chế độ public và môi trường chấm cần
-có kết nối mạng. Checkpoint được tải vào file tạm `./models/best.pth.download`
-rồi mới đổi tên thành `./models/best.pth`, tránh sử dụng file tải chưa hoàn tất.
-
-Khi không truyền cấu hình hậu xử lý, chương trình tự dùng các giá trị mặc định
-đã chọn trước: confidence threshold `0.02`, NMS IoU threshold `0.55`, kích
-thước TTA `448`, TTA lật ngang luôn bật và tối đa `150` hộp trên mỗi ảnh.
 
 ### Bước 4: Tự chấm điểm và Đánh giá mAP@0.5
 
@@ -101,31 +89,16 @@ python tools/evaluate_predictions.py \
 
 ## Chạy và Chấm bằng Docker
 
-Các lệnh dưới đây cần được chạy lần lượt từ thư mục gốc của dự án, nơi chứa
-`Dockerfile`, `predict.py`, `models/` và `public/`.
+### Yêu cầu
 
-### Bước 1: Di chuyển vào thư mục dự án
+- Đã cài đặt Docker Desktop hoặc Docker Engine.
+- Chạy các lệnh từ **thư mục gốc dự án**, nơi chứa `Dockerfile`, `predict.py`
+  và thư mục `public/`.
 
-```bash
-cd /Users/nguyennangthinh/Downloads/computer-vision
-ls Dockerfile predict.py public/val/images
-```
-
-### Bước 2: Build Docker image
-
-Trên máy Linux x86_64 hoặc máy chấm của giảng viên:
+### Bước 1: Build Docker image
 
 ```bash
 docker build -t object-detection-exam:2026 .
-```
-
-Trên Mac Apple Silicon, có thể build image tương thích Linux AMD64:
-
-```bash
-docker buildx build \
-  --platform linux/amd64 \
-  --load \
-  -t object-detection-exam:2026 .
 ```
 
 Kiểm tra image đã được tạo:
@@ -134,17 +107,24 @@ Kiểm tra image đã được tạo:
 docker images object-detection-exam:2026
 ```
 
-### Bước 3: Tạo thư mục chứa kết quả chấm
+### Bước 2: Mở terminal tại thư mục dự án
+
+Di chuyển vào thư mục dự án theo vị trí thực tế trên máy:
+
+```bash
+cd my_submission
+```
+
+### Bước 3: Tạo thư mục chứa kết quả
 
 ```bash
 mkdir -p grading_outputs
 ```
 
-### Bước 4: Chạy inference bằng Docker
+### Bước 4: Chạy inference
 
 ```bash
 docker run --rm --gpus all \
-  -w /workspace \
   -v "$PWD/public/val/images:/exam/val_images:ro" \
   -v "$PWD:/workspace" \
   -v "$PWD/grading_outputs:/exam/outputs" \
@@ -154,19 +134,14 @@ docker run --rm --gpus all \
     --output /exam/outputs/val_predictions.json
 ```
 
-Nếu `./models/best.pth` chưa tồn tại, `predict.py` tự tải weight từ Hugging
-Face về thư mục `models/`. Do dự án được mount vào `/workspace`, file weight
-đã tải vẫn được giữ trên máy sau khi container kết thúc.
+Trên máy ARM, thêm `--platform linux/amd64` ngay sau `docker run --rm` nếu
+Docker không tự chọn đúng platform.
 
-### Bước 5: Kiểm tra file predictions
+Nếu `./models/best.pth` chưa tồn tại, `predict.py` tự tải weight từ HuggingFace.
 
-```bash
-ls -lh grading_outputs/val_predictions.json
-```
+### Bước 5: Chấm mAP trên validation
 
-### Bước 6: Chấm mAP trên validation
-
-Chạy evaluator bên ngoài Docker:
+Chạy evaluator từ môi trường Python bên ngoài Docker:
 
 ```bash
 python public/tools/evaluate_predictions.py \
@@ -174,12 +149,3 @@ python public/tools/evaluate_predictions.py \
   --predictions grading_outputs/val_predictions.json \
   --output grading_outputs/val_score.json
 ```
-
-Xem kết quả:
-
-```bash
-cat grading_outputs/val_score.json
-```
-
-Khi giảng viên chạy lệnh inference tối giản, `predict.py` tự sử dụng toàn bộ
-cấu hình hậu xử lý mặc định được khai báo trong script.
